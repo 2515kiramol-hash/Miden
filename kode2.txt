@@ -1,0 +1,1896 @@
+// kernel/src/kernels/kernel_64.rs
+// midenOS v8.2: ЧАСТЬ 1 (Аллокатор, Multiboot2, Фреймбуфер, Шрифт, GUI, Окна)
+
+#![allow(static_mut_refs)]
+
+use core::arch::asm;
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::ptr;
+use core::ffi::c_int;
+
+// ==========================================
+// 1. АЛЛОКАТОР И ДИНАМИЧЕСКИЙ ФРЕЙМБУФЕР
+// ==========================================
+pub struct CoreAllocator { _heap_start: usize, heap_end: usize, next: AtomicUsize }
+
+unsafe impl GlobalAlloc for CoreAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let align = layout.align();
+        let size = layout.size();
+        loop {
+            let current_next = self.next.load(Ordering::Relaxed);
+            let alloc_start = (current_next + align - 1) & !(align - 1);
+            let alloc_end = alloc_start + size;
+            if alloc_end > self.heap_end { return core::ptr::null_mut(); }
+            if self.next.compare_exchange(current_next, alloc_end, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return alloc_start as *mut u8;
+            }
+        }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOCATOR: CoreAllocator = CoreAllocator {
+    _heap_start: 0x04000000,
+    heap_end: 0x04000000 + (64 * 1024 * 1024),
+    next: AtomicUsize::new(0x04000000),
+};
+
+pub const SCREEN_W: isize = 1024;
+pub const SCREEN_H: isize = 768;
+pub static mut REAL_FB: *mut u32 = 0xFD000000 as *mut u32;
+pub static mut IS_DIAG_MODE: bool = false;
+
+pub fn check_bounds(mx: isize, my: isize, rx: isize, ry: isize, rw: isize, rh: isize) -> bool {
+    mx >= rx && mx < rx + rw && my >= ry && my < ry + rh
+}
+
+// ==========================================
+// 2. НАСТРОЙКИ
+// ==========================================
+static mut THEME_ID: u8 = 0;
+static mut CURSOR_SPEED: u8 = 1;
+static mut BRIGHTNESS: u8 = 1;
+static mut ICON_SIZE: u8 = 1;
+static mut SHOW_CLOCK: bool = true;
+static mut ANIMATIONS: bool = true;
+
+static mut CACHE_VALID: bool = false;
+static mut C_FG_TOP: u32 = 0;
+static mut C_BG_BOT: u32 = 0;
+static mut C_ACCENT: u32 = 0;
+static mut C_ACCENT_DARK: u32 = 0;
+static mut C_TXT: u32 = 0;
+static mut C_TXT_LIGHT: u32 = 0;
+
+unsafe fn refresh_theme_cache() {
+    let (fg, bg, acc, acc_d, txt, txt_l) = match THEME_ID {
+        0 => (0x003A3A3C, 0x001A1A1C, 0x00C03030, 0x00601010, 0x00601010, 0x00FFFFFF),
+        1 => (0x0030303A, 0x001A1A20, 0x00306CC0, 0x00103060, 0x00103060, 0x00FFFFFF),
+        2 => (0x00303A30, 0x001A201A, 0x0030A040, 0x00106020, 0x00106020, 0x00FFFFFF),
+        3 => (0x003A3A3A, 0x00202020, 0x00606060, 0x00303030, 0x00303030, 0x00FFFFFF),
+        _ => (0x003A3040, 0x001A1020, 0x008030C0, 0x00401060, 0x00401060, 0x00FFFFFF),
+    };
+    let m = match BRIGHTNESS { 0 => 180, 2 => 255, _ => 220 };
+    let ab = |c: u32| -> u32 {
+        let r = ((c >> 16) & 0xFF) * m / 255;
+        let g = ((c >> 8) & 0xFF) * m / 255;
+        let b = (c & 0xFF) * m / 255;
+        (r << 16) | (g << 8) | b
+    };
+    C_FG_TOP = ab(fg);
+    C_BG_BOT = ab(bg);
+    C_ACCENT = ab(acc);
+    C_ACCENT_DARK = ab(acc_d);
+    C_TXT = ab(txt);
+    C_TXT_LIGHT = ab(txt_l);
+    CACHE_VALID = true;
+}
+
+unsafe fn theme_colors() -> (u32, u32, u32, u32, u32, u32) {
+    if !CACHE_VALID { refresh_theme_cache(); }
+    (C_FG_TOP, C_BG_BOT, C_ACCENT, C_ACCENT_DARK, C_TXT, C_TXT_LIGHT)
+}
+
+unsafe fn icon_size() -> isize { match ICON_SIZE { 0 => 40, 2 => 64, _ => 52 } }
+unsafe fn cursor_speed_mul() -> isize { match CURSOR_SPEED { 0 => 1, 2 => 3, _ => 2 } }
+
+// ==========================================
+// 3. BMP WALLPAPER И MULTIBOOT2
+// ==========================================
+core::arch::global_asm!(
+    r#"
+    .section .rodata
+    .global _wallpaper_start
+    .global _wallpaper_end
+    .align 16
+    _wallpaper_start:
+    .incbin "src/kernels/wallpaper.bmp"
+    _wallpaper_end:
+    .byte 0
+    .section .text
+    "#
+);
+
+extern "C" {
+    static _wallpaper_start: u8;
+    static _wallpaper_end: u8;
+}
+
+pub static mut WALLPAPER_ADDR: usize = 0;
+pub static mut WALLPAPER_SIZE: usize = 0;
+
+pub unsafe fn init_wallpaper_embedded() {
+    let start = &_wallpaper_start as *const u8 as usize;
+    let end = &_wallpaper_end as *const u8 as usize;
+    WALLPAPER_ADDR = start;
+    WALLPAPER_SIZE = end.wrapping_sub(start);
+}
+
+pub unsafe fn parse_multiboot2(mb_info_addr: usize) {
+    if mb_info_addr == 0 { return; }
+    let total_size = *(mb_info_addr as *const u32) as usize;
+    let mut offset = 8usize;
+    while offset + 8 <= total_size {
+        let tag_ptr = (mb_info_addr + offset) as *const u32;
+        let tag_type = *tag_ptr;
+        let tag_size = *tag_ptr.add(1) as usize;
+        if tag_type == 0 || tag_size < 8 { break; }
+
+        if tag_type == 1 && tag_size > 8 {
+            let slice = core::slice::from_raw_parts((mb_info_addr + offset + 8) as *const u8, tag_size - 8);
+            if let Ok(cmdline) = core::str::from_utf8(slice) {
+                if cmdline.contains("diag") { IS_DIAG_MODE = true; }
+            }
+        }
+        if tag_type == 8 && tag_size >= 32 {
+            let fb_addr = *((mb_info_addr + offset + 8) as *const u64) as usize;
+            if fb_addr != 0 { REAL_FB = fb_addr as *mut u32; }
+        }
+        offset += (tag_size + 7) & !7;
+    }
+}
+
+// ==========================================
+// 4. BMP LOADER
+// ==========================================
+#[inline(always)]
+unsafe fn read_u16(ptr: *const u8, off: usize) -> u16 {
+    *ptr.add(off) as u16 | ((*ptr.add(off + 1) as u16) << 8)
+}
+
+#[inline(always)]
+unsafe fn read_u32(ptr: *const u8, off: usize) -> u32 {
+    *ptr.add(off) as u32
+    | ((*ptr.add(off + 1) as u32) << 8)
+    | ((*ptr.add(off + 2) as u32) << 16)
+    | ((*ptr.add(off + 3) as u32) << 24)
+}
+
+unsafe fn try_draw_wallpaper_bmp(fb: *mut u32) -> bool {
+    if WALLPAPER_ADDR == 0 || WALLPAPER_SIZE < 54 { return false; }
+    let bmp = WALLPAPER_ADDR as *const u8;
+    if *bmp != b'B' || *bmp.add(1) != b'M' { return false; }
+    let data_offset = read_u32(bmp, 10) as usize;
+    let dib_size = read_u32(bmp, 14);
+    let width = read_u32(bmp, 18) as i32;
+    let height = read_u32(bmp, 22) as i32;
+    let bpp = read_u16(bmp, 28);
+    let compression = read_u32(bmp, 30);
+    if compression != 0 { return false; }
+    if bpp != 24 && bpp != 32 { return false; }
+    if width <= 0 || height == 0 { return false; }
+    if dib_size < 40 || data_offset >= WALLPAPER_SIZE { return false; }
+    let abs_h = if height < 0 { -height } else { height };
+    let bmp_w = width as isize;
+    let bmp_h = abs_h as isize;
+    let bottom_up = height > 0;
+    let row_stride = ((bmp_w * (bpp as isize) + 31) / 32) * 4;
+    let min_size = data_offset + (row_stride * bmp_h) as usize;
+    if min_size > WALLPAPER_SIZE { return false; }
+    let bpp_bytes = (bpp as isize) / 8;
+    let src = bmp.add(data_offset);
+    for py in 0..SCREEN_H {
+        let row = fb.offset(py * SCREEN_W);
+        for px in 0..SCREEN_W {
+            let sx = (px * bmp_w / SCREEN_W).max(0).min(bmp_w - 1);
+            let sy_screen = (py * bmp_h / SCREEN_H).max(0).min(bmp_h - 1);
+            let sy = if bottom_up { bmp_h - 1 - sy_screen } else { sy_screen };
+            let src_off = (sy * row_stride + sx * bpp_bytes) as usize;
+            let r = *src.add(src_off + 2);
+            let g = *src.add(src_off + 1);
+            let b = *src.add(src_off);
+            let a = if bpp == 32 { *src.add(src_off + 3) } else { 255 };
+            if bpp == 32 && a < 16 { continue; }
+            *row.offset(px) = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        }
+    }
+    true
+}
+
+// ==========================================
+// 5. ДРАЙВЕР ФРЕЙМБУФЕРА
+// ==========================================
+#[inline(always)]
+unsafe fn fb_wait_vsync() {
+    let mut timeout = 100_000u32;
+    while timeout > 0 {
+        let status: u8;
+        asm!("in al, dx", in("dx") 0x3DAu16, out("al") status, options(nomem, nostack, preserves_flags));
+        if (status & 0x08) == 0 { break; }
+        timeout -= 1;
+    }
+    timeout = 100_000;
+    while timeout > 0 {
+        let status: u8;
+        asm!("in al, dx", in("dx") 0x3DAu16, out("al") status, options(nomem, nostack, preserves_flags));
+        if (status & 0x08) != 0 { break; }
+        timeout -= 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn fast_copy_qwords(dst: *mut u64, src: *const u64, count: usize) {
+    if count == 0 { return; }
+    asm!(
+        "rep movsq",
+         inout("rcx") count => _,
+         inout("rdi") dst => _,
+         inout("rsi") src => _,
+         options(nostack, preserves_flags)
+    );
+}
+
+unsafe fn fb_flush_rect(x: isize, y: isize, w: isize, h: isize) {
+    if w <= 0 || h <= 0 { return; }
+    let mut cx = x; let mut cy = y; let mut cw = w; let mut ch = h;
+    if cx < 0 { cw += cx; cx = 0; }
+    if cy < 0 { ch += cy; cy = 0; }
+    if cx + cw > SCREEN_W { cw = SCREEN_W - cx; }
+    if cy + ch > SCREEN_H { ch = SCREEN_H - cy; }
+    if cw <= 0 || ch <= 0 { return; }
+    let back = (*ptr::addr_of_mut!(BACK_BUFFER)).data.as_ptr();
+    let screen = REAL_FB;
+    if cw == SCREEN_W {
+        let count = (cw * ch) as usize / 2;
+        let dst = screen.offset(cy * SCREEN_W) as *mut u64;
+        let src = back.offset(cy * SCREEN_W) as *const u64;
+        fast_copy_qwords(dst, src, count);
+        return;
+    }
+    for dy in 0..ch {
+        let dst_row = screen.offset((cy + dy) * SCREEN_W + cx);
+        let src_row = back.offset((cy + dy) * SCREEN_W + cx);
+        if cw % 2 == 0 {
+            fast_copy_qwords(dst_row as *mut u64, src_row as *const u64, cw as usize / 2);
+        } else {
+            let count = (cw - 1) as usize / 2;
+            if count > 0 { fast_copy_qwords(dst_row as *mut u64, src_row as *const u64, count); }
+            *dst_row.offset(cw - 1) = *src_row.offset(cw - 1);
+        }
+    }
+}
+
+unsafe fn fb_flush_all() {
+    let count = (SCREEN_W * SCREEN_H) as usize / 2;
+    fast_copy_qwords(REAL_FB as *mut u64, (*ptr::addr_of_mut!(BACK_BUFFER)).data.as_ptr() as *const u64, count);
+}
+// ==========================================
+// 6. ШРИФТ
+// ==========================================
+static MAIN_FONT: &[([u8; 8], char)] = &[
+    ([0x3E, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'A'), ([0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00], 'B'),
+    ([0x3E, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3E, 0x00], 'C'), ([0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00], 'D'),
+    ([0x7E, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x7E, 0x00], 'E'), ([0x7E, 0x60, 0x78, 0x60, 0x60, 0x60, 0x60, 0x00], 'F'),
+    ([0x3E, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00], 'G'), ([0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'H'),
+    ([0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00], 'I'), ([0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0x00], 'J'),
+    ([0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'K'), ([0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00], 'L'),
+    ([0x66, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'M'), ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'N'),
+    ([0x3E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'O'), ([0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00], 'P'),
+    ([0x3E, 0x66, 0x66, 0x66, 0x6E, 0x3C, 0x1E, 0x00], 'Q'), ([0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00], 'R'),
+    ([0x3E, 0x66, 0x60, 0x3E, 0x06, 0x66, 0x3E, 0x00], 'S'), ([0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], 'T'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'U'), ([0x66, 0x66, 0x66, 0x3C, 0x3C, 0x3C, 0x18, 0x00], 'V'),
+    ([0x66, 0x66, 0x66, 0x7E, 0x7E, 0x66, 0x66, 0x00], 'W'), ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'X'),
+    ([0x66, 0x66, 0x66, 0x3E, 0x0C, 0x18, 0x30, 0x00], 'Y'), ([0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x7E, 0x00], 'Z'),
+    ([0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00], 'a'), ([0x00, 0x00, 0x7C, 0x62, 0x7E, 0x66, 0x7C, 0x00], 'b'),
+    ([0x00, 0x00, 0x3E, 0x60, 0x60, 0x66, 0x3E, 0x00], 'c'), ([0x00, 0x00, 0x1E, 0x66, 0x66, 0x66, 0x3E, 0x00], 'd'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x7E, 0x60, 0x3E, 0x00], 'e'), ([0x00, 0x10, 0x3C, 0x10, 0x30, 0x10, 0x10, 0x00], 'f'),
+    ([0x00, 0x00, 0x3E, 0x60, 0x3E, 0x66, 0x3E, 0x00], 'g'), ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00], 'h'),
+    ([0x00, 0x18, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00], 'i'), ([0x00, 0x0C, 0x00, 0x0C, 0x0C, 0x0C, 0x38, 0x00], 'j'),
+    ([0x60, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'k'), ([0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x1C, 0x00], 'l'),
+    ([0x00, 0x00, 0x76, 0x7E, 0x66, 0x66, 0x66, 0x00], 'm'), ([0x00, 0x00, 0xDC, 0x66, 0x66, 0x66, 0x66, 0x00], 'n'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00], 'o'), ([0x00, 0x00, 0x7C, 0x66, 0x7C, 0x60, 0x60, 0x00], 'p'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x3E, 0x02, 0x02, 0x00], 'q'), ([0x00, 0x00, 0x5C, 0x66, 0x60, 0x60, 0x60, 0x00], 'r'),
+    ([0x00, 0x00, 0x3E, 0x60, 0x3E, 0x06, 0x3E, 0x00], 's'), ([0x00, 0x10, 0x7C, 0x10, 0x10, 0x14, 0x18, 0x00], 't'),
+    ([0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'u'), ([0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18], 'v'),
+    ([0x00, 0x00, 0x66, 0x66, 0x7E, 0x7E, 0x66, 0x00], 'w'), ([0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00], 'x'),
+    ([0x00, 0x00, 0x66, 0x66, 0x3E, 0x06, 0x3E, 0x00], 'y'), ([0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x7E, 0x00], 'z'),
+    ([0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00], '0'), ([0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00], '1'),
+    ([0x3C, 0x66, 0x06, 0x0C, 0x30, 0x60, 0x7E, 0x00], '2'), ([0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00], '3'),
+    ([0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x0C, 0x00], '4'), ([0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00], '5'),
+    ([0x3C, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x3C, 0x00], '6'), ([0x7E, 0x66, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00], '7'),
+    ([0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00], '8'), ([0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00], '9'),
+    ([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], ' '), ([0x00, 0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00], '!'),
+    ([0x00, 0x00, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00], ':'), ([0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00], '_'),
+    ([0x00, 0x00, 0x3C, 0x42, 0x42, 0x3C, 0x00, 0x00], '.'), ([0x3A, 0x5C, 0x3A, 0x00, 0x00, 0x00, 0x00, 0x00], '>'),
+    ([0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00], '-'), ([0x00, 0x7E, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00], '='),
+    ([0x3E, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'А'), ([0x7C, 0x62, 0x66, 0x7E, 0x66, 0x66, 0x7C, 0x00], 'Б'),
+    ([0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00], 'В'), ([0x7E, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x00], 'Г'),
+    ([0x6E, 0x76, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'Д'), ([0x7E, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x7E, 0x00], 'Е'),
+    ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'Ж'), ([0x3E, 0x66, 0x06, 0x1C, 0x06, 0x3E, 0x3E, 0x00], 'З'),
+    ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'И'), ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'Й'),
+    ([0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'К'), ([0x30, 0x30, 0x30, 0x30, 0x30, 0x66, 0x66, 0x00], 'Л'),
+    ([0x66, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'М'), ([0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'Н'),
+    ([0x3E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'О'), ([0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'П'),
+    ([0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00], 'Р'), ([0x3E, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3E, 0x00], 'С'),
+    ([0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], 'Т'), ([0x66, 0x66, 0x66, 0x3E, 0x0C, 0x18, 0x70, 0x00], 'У'),
+    ([0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00], 'Ф'), ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'Х'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'Ц'), ([0x66, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x06, 0x00], 'Ч'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7E, 0x00], 'Ш'), ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'Щ'),
+    ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'Ъ'), ([0x62, 0x62, 0x7A, 0x66, 0x66, 0x66, 0x7A, 0x00], 'Ы'),
+    ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'Ь'), ([0x3E, 0x06, 0x06, 0x1E, 0x06, 0x06, 0x3E, 0x00], 'Э'),
+    ([0x46, 0x66, 0x26, 0x36, 0x66, 0x66, 0x64, 0x00], 'Ю'), ([0x3E, 0x66, 0x66, 0x3E, 0x26, 0x66, 0x66, 0x00], 'Я'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x7E, 0x60, 0x3E, 0x00], 'ё'), ([0x3E, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'а'),
+    ([0x7C, 0x62, 0x66, 0x7E, 0x66, 0x66, 0x7C, 0x00], 'б'), ([0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00], 'в'),
+    ([0x7E, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x00], 'г'), ([0x6E, 0x76, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'д'),
+    ([0x7E, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x7E, 0x00], 'е'), ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'ж'),
+    ([0x3E, 0x66, 0x06, 0x1C, 0x06, 0x3E, 0x3E, 0x00], 'з'), ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'и'),
+    ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'й'), ([0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'к'),
+    ([0x30, 0x30, 0x30, 0x30, 0x30, 0x66, 0x66, 0x00], 'л'), ([0x66, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'м'),
+    ([0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'н'), ([0x3E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'о'),
+    ([0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'п'), ([0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00], 'р'),
+    ([0x3E, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3E, 0x00], 'с'), ([0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], 'т'),
+    ([0x66, 0x66, 0x66, 0x3E, 0x0C, 0x18, 0x70, 0x00], 'у'), ([0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00], 'ф'),
+    ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'х'), ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'ц'),
+    ([0x66, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x06, 0x00], 'ч'), ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7E, 0x00], 'ш'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'щ'), ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'ъ'),
+    ([0x62, 0x62, 0x7A, 0x66, 0x66, 0x66, 0x7A, 0x00], 'ы'), ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'ь'),
+    ([0x3E, 0x06, 0x06, 0x1E, 0x06, 0x06, 0x3E, 0x00], 'э'), ([0x46, 0x66, 0x26, 0x36, 0x66, 0x66, 0x64, 0x00], 'ю'),
+    ([0x3E, 0x66, 0x66, 0x3E, 0x26, 0x66, 0x66, 0x00], 'я'),
+];
+pub unsafe fn draw_txt(fb: *mut u32, x: isize, y: isize, text: &str, color: u32) {
+    let c = color;
+    let mut curr_x = x;
+    for target_char in text.chars() {
+        for font_idx in 0..MAIN_FONT.len() {
+            if MAIN_FONT[font_idx].1 == target_char {
+                let bitmap = MAIN_FONT[font_idx].0;
+                for row in 0..8 {
+                    let bits = bitmap[row];
+                    if bits == 0 { continue; }
+                    for col in 0..8 {
+                        if (bits & (1 << (7 - col))) != 0 {
+                            let px = curr_x + col as isize;
+                            let py = y + row as isize;
+                            if px >= 0 && px < SCREEN_W && py >= 0 && py < SCREEN_H {
+                                *fb.offset(py * SCREEN_W + px) = c;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        curr_x += 9;
+    }
+}
+unsafe fn blend_color(bg: u32, fg: u32, alpha: u8) -> u32 {
+    let inv_alpha = 255 - alpha as u32;
+    let bg_r = (bg >> 16) & 0xFF; let bg_g = (bg >> 8) & 0xFF; let bg_b = bg & 0xFF;
+    let fg_r = (fg >> 16) & 0xFF; let fg_g = (fg >> 8) & 0xFF; let fg_b = fg & 0xFF;
+    let r = ((bg_r * inv_alpha + fg_r * alpha as u32) / 255) & 0xFF;
+    let g = ((bg_g * inv_alpha + fg_g * alpha as u32) / 255) & 0xFF;
+    let b = ((bg_b * inv_alpha + fg_b * alpha as u32) / 255) & 0xFF;
+    (r << 16) | (g << 8) | b
+}
+// ==========================================
+// 7. 3D-ИКОНКИ
+// ==========================================
+#[inline(always)]
+unsafe fn put_px(fb: *mut u32, x: isize, y: isize, c: u32) {
+    if x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H {
+        *fb.offset(y * SCREEN_W + x) = c;
+    }
+}
+unsafe fn draw_rounded_rect_3d(fb: *mut u32, x: isize, y: isize, w: isize, h: isize, radius: isize, base_top: u32, base_bot: u32) {
+    if w <= 0 || h <= 0 { return; }
+    let rt = (base_top >> 16) & 0xFF; let gt = (base_top >> 8) & 0xFF; let bt = base_top & 0xFF;
+    let rb = (base_bot >> 16) & 0xFF; let gb = (base_bot >> 8) & 0xFF; let bb = base_bot & 0xFF;
+    for dy in 0..h {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        let t = (dy as u32 * 255) / h.max(1) as u32;
+        let r = rt - (rt - rb) * t / 255;
+        let g = gt - (gt - gb) * t / 255;
+        let b = bt - (bt - bb) * t / 255;
+        let fill = (r << 16) | (g << 8) | b;
+        let highlight = if dy < h / 3 {
+            let hl_t = (dy as u32 * 100) / (h / 3).max(1) as u32;
+            blend_color(fill, 0x00FFFFFF, (50 - hl_t / 2) as u8)
+        } else { fill };
+        for dx in 0..w {
+            let px = x + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let mut skip = false;
+            if dx < radius && dy < radius {
+                let cx = radius - dx; let cy = radius - dy;
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            } else if dx > w - radius && dy < radius {
+                let cx = dx - (w - radius); let cy = radius - dy;
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            } else if dx < radius && dy > h - radius {
+                let cx = radius - dx; let cy = dy - (h - radius);
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            } else if dx > w - radius && dy > h - radius {
+                let cx = dx - (w - radius); let cy = dy - (h - radius);
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            }
+            if skip { continue; }
+            *row.offset(px) = highlight;
+        }
+    }
+}
+unsafe fn draw_icon_shadow(fb: *mut u32, cx: isize, cy: isize, rx: isize, ry: isize) {
+    for dy in -ry..=ry {
+        let py = cy + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        for dx in -rx..=rx {
+            let px = cx + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let d = (dx * dx * 100) / (rx * rx).max(1) + (dy * dy * 100) / (ry * ry).max(1);
+            if d <= 100 {
+                let alpha = ((100 - d) * 80 / 100) as u8;
+                let p = *fb.offset(py * SCREEN_W + px);
+                *fb.offset(py * SCREEN_W + px) = blend_color(p, 0x00000000, alpha);
+            }
+        }
+    }
+}
+unsafe fn icon_symbol_calc(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 6;
+    let cell = (sz - pad * 2) / 4;
+    for dy in pad..(pad + cell) { for dx in pad..(sz - pad) {
+        put_px(fb, x + dx, y + dy, blend_color(fg, 0x00FFFFFF, 180));
+    }}
+    for row in 0..3 {
+        for col in 0..3 {
+            let bx = pad + col * (cell + 1);
+            let by = pad + cell + 2 + row * (cell + 1);
+            for dy in 0..(cell - 2) { for dx in 0..(cell - 2) {
+                put_px(fb, x + bx + dx, y + by + dy, blend_color(fg, 0x00FFFFFF, 220));
+            }}
+        }
+    }
+}
+unsafe fn icon_symbol_folder(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 5;
+    let h = sz - pad * 2;
+    let w = sz - pad * 2;
+    for dy in (pad + h / 4)..(pad + h) { for dx in pad..(pad + w) {
+        put_px(fb, x + dx, y + dy, fg);
+    }}
+    for dy in pad..(pad + h / 4) { for dx in pad..(pad + w / 2) {
+        put_px(fb, x + dx, y + dy, fg);
+    }}
+}
+unsafe fn icon_symbol_gear(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let cx = sz / 2; let cy = sz / 2;
+    let r_outer = sz / 2 - 2;
+    let r_inner = sz / 4;
+    for dy in -r_outer..=r_outer {
+        for dx in -r_outer..=r_outer {
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r_outer * r_outer && d2 >= r_inner * r_inner {
+                put_px(fb, x + cx + dx, y + cy + dy, fg);
+            }
+        }
+    }
+    for dy in -r_inner..=r_inner {
+        for dx in -r_inner..=r_inner {
+            if dx * dx + dy * dy <= r_inner * r_inner {
+                put_px(fb, x + cx + dx, y + cy + dy, blend_color(fg, 0x00000000, 200));
+            }
+        }
+    }
+}
+unsafe fn icon_symbol_notepad(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 5;
+    let line_h = sz / 8;
+    for line in 0..4 {
+        let ly = pad + line * (line_h + 1);
+        for dy in 0..2 { for dx in pad..(sz - pad) {
+            put_px(fb, x + dx, y + ly + dy, fg);
+        }}
+    }
+}
+unsafe fn icon_symbol_taskman(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 6;
+    let w = sz - pad * 2;
+    let h = sz - pad * 2;
+    for dx in 0..w { for dy in 0..2 {
+        put_px(fb, x + pad + dx, y + pad + h - 2 - dy, fg);
+    }}
+    for dy in 0..h { for dx in 0..2 {
+        put_px(fb, x + pad + dx, y + pad + dy, fg);
+    }}
+    let bars = [h * 3 / 4, h * 1 / 2, h * 2 / 3];
+    for (i, &bh) in bars.iter().enumerate() {
+        let bx = pad + 4 + (i as isize) * (w / 4);
+        for dy in 0..bh { for dx in 0..(w / 6) {
+            put_px(fb, x + bx + dx, y + pad + h - 2 - dy, fg);
+        }}
+    }
+}
+unsafe fn draw_icon_3d(fb: *mut u32, x: isize, y: isize, sz: isize, base_top: u32, base_bot: u32, symbol: u8, fg: u32) {
+    draw_icon_shadow(fb, x + sz / 2 + 3, y + sz + 2, sz / 2, sz / 6);
+    let radius = sz / 6;
+    draw_rounded_rect_3d(fb, x, y, sz, sz, radius, base_top, base_bot);
+    let pad = sz / 4;
+    let inner = sz / 2;
+    let sx = x + pad;
+    let sy = y + pad;
+    match symbol {
+        0 => icon_symbol_calc(fb, sx, sy, inner, fg),
+        1 => icon_symbol_folder(fb, sx, sy, inner, fg),
+        2 => icon_symbol_gear(fb, sx, sy, inner, fg),
+        3 => icon_symbol_notepad(fb, sx, sy, inner, fg),
+        4 => icon_symbol_taskman(fb, sx, sy, inner, fg),
+        _ => {}
+    }
+}
+pub unsafe fn draw_calc_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00E8503A, 0x00A02020, 0, 0x00FFFFFF); }
+pub unsafe fn draw_folder_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00F5B942, 0x00C07818, 1, 0x00A05000); }
+pub unsafe fn draw_settings_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00C8D0D8, 0x00707880, 2, 0x00384048); }
+pub unsafe fn draw_notepad_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x0050A0E8, 0x002060A0, 3, 0x00FFFFFF); }
+pub unsafe fn draw_taskman_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00D04040, 0x00801818, 4, 0x00FFFFFF); }
+pub unsafe fn draw_browser_icon(fb: *mut u32, x: isize, y: isize) {
+    let sz = icon_size();
+    draw_icon_3d(fb, x, y, sz, 0x0040A0E0, 0x002060A0, 3, 0x00FFFFFF);
+    if net_link_up() {
+        let cx = x + sz - 8;
+        let cy = y + 8;
+        for dy in -4..=4 {
+            for dx in -4..=4 {
+                if dx * dx + dy * dy <= 16 { put_px(fb, cx + dx, cy + dy, 0x0000FF00); }
+            }
+        }
+    }
+}
+unsafe fn draw_icon_label_3d(fb: *mut u32, x: isize, y: isize, text: &str, color: u32) {
+    draw_txt(fb, x + 1, y + 1, text, 0x00000000);
+    draw_txt(fb, x, y, text, color);
+}
+// ==========================================
+// 8. AERO + КНОПКИ
+// ==========================================
+unsafe fn draw_aero_window(fb: *mut u32, x: isize, y: isize, width: isize, height: isize, _anim_progress: u8) {
+    if anim_progress == 0 || width <= 0 || height <= 0 { return; }
+    let (, _, accent, accent_dark, _, _) = theme_colors();
+    let panel = 0x00F0F0F0u32;
+    for dy in 30..(height - 4) {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 4..(width - 4) {
+            let px = x + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let p = *row.offset(px);
+            *row.offset(px) = blend_color(p, panel, 230);
+        }
+    }
+    for dx in 0..width {
+        let px = x + dx;
+        if px < 0 || px >= SCREEN_W { continue; }
+        for t in 0..3 {
+            let py1 = y + t;
+            if py1 >= 0 && py1 < SCREEN_H { *fb.offset(py1 * SCREEN_W + px) = blend_color(*fb.offset(py1 * SCREEN_W + px), accent, 220); }
+            let py2 = y + height - 1 - t;
+            if py2 >= 0 && py2 < SCREEN_H { *fb.offset(py2 * SCREEN_W + px) = blend_color(*fb.offset(py2 * SCREEN_W + px), accent_dark, 220); }
+        }
+    }
+    for dy in 0..height {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        for t in 0..3 {
+            let px1 = x + t;
+            if px1 >= 0 && px1 < SCREEN_W { *fb.offset(py * SCREEN_W + px1) = blend_color(*fb.offset(py * SCREEN_W + px1), accent, 220); }
+            let px2 = x + width - 1 - t;
+            if px2 >= 0 && px2 < SCREEN_W { *fb.offset(py * SCREEN_W + px2) = blend_color(*fb.offset(py * SCREEN_W + px2), accent_dark, 220); }
+        }
+    }
+}
+unsafe fn draw_aero_titlebar(fb: *mut u32, x: isize, y: isize, w: isize, title: &str, anim: u8) {
+    if anim == 0 { return; }
+    let alpha = ((anim as u32) * 230 / 100) as u8;
+    let (_, _, accent, accent_dark, txt_dark, _) = theme_colors();
+    let ar = (accent >> 16) & 0xFF; let ag = (accent >> 8) & 0xFF; let ab = accent & 0xFF;
+    for dy in 0..26 {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let t = (dy as u32 * 100) / 26;
+        let aero = ((ar - (t * ar) / 200) << 16) | ((ag - (t * ag) / 200) << 8) | (ab - (t * ab) / 200);
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..w {
+            let px = x + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            *row.offset(px) = blend_color(*row.offset(px), aero, alpha);
+        }
+    }
+    draw_txt(fb, x + 10, y + 7, title, txt_dark);
+    draw_txt(fb, x + 9, y + 6, title, 0x00FFFFFF);
+    let bx = x + w - 78;
+    draw_aero_button(fb, bx, y + 5, 22, "—", blend_color(accent, 0x00FFFFFF, 60), txt_dark);
+    draw_aero_button(fb, bx + 24, y + 5, 22, "□", blend_color(accent, 0x00FFFFFF, 60), txt_dark);
+    draw_aero_button(fb, bx + 48, y + 5, 22, "×", blend_color(accent_dark, 0x00000000, 40), 0x00FFFFFF);
+}
+unsafe fn draw_aero_button(fb: *mut u32, x: isize, y: isize, s: isize, sym: &str, bg: u32, fg: u32) {
+    for dy in 0..s {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let t = (dy as u32 * 60) / s as u32;
+        let btn = blend_color(bg, 0x0
+        0FFFFFF, (60 - t) as u8);
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..s {
+            let px = x + dx;
+            if px >= 0 && px < SCREEN_W { *row.offset(px) = btn; }
+        }
+    }
+    draw_txt(fb, x + 7, y + 6, sym, fg);
+}
+
+} // конец draw_aero_button (строка 643)
+fast_copy_qwords(REAL_FB as *mut u64, (*ptr::addr_of_mut!(BACK_BUFFER)).data.as_ptr() as *const u64, count); // <-- лишний хвост (строка 644)
+} // <-- лишняя скобка (строка 645)
+
+// ==========================================
+// 6. ШРИФТ
+// ==========================================
+static MAIN_FONT: &[([u8; 8], char)] = &[
+    ([0x3E, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'A'), ([0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00], 'B'),
+    ([0x3E, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3E, 0x00], 'C'), ([0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00], 'D'),
+    ([0x7E, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x7E, 0x00], 'E'), ([0x7E, 0x60, 0x78, 0x60, 0x60, 0x60, 0x60, 0x00], 'F'),
+    ([0x3E, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00], 'G'), ([0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'H'),
+    ([0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00], 'I'), ([0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0x00], 'J'),
+    ([0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'K'), ([0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00], 'L'),
+    ([0x66, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'M'), ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'N'),
+    ([0x3E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'O'), ([0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00], 'P'),
+    ([0x3E, 0x66, 0x66, 0x66, 0x6E, 0x3C, 0x1E, 0x00], 'Q'), ([0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00], 'R'),
+    ([0x3E, 0x66, 0x60, 0x3E, 0x06, 0x66, 0x3E, 0x00], 'S'), ([0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], 'T'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'U'), ([0x66, 0x66, 0x66, 0x3C, 0x3C, 0x3C, 0x18, 0x00], 'V'),
+    ([0x66, 0x66, 0x66, 0x7E, 0x7E, 0x66, 0x66, 0x00], 'W'), ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'X'),
+    ([0x66, 0x66, 0x66, 0x3E, 0x0C, 0x18, 0x30, 0x00], 'Y'), ([0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x7E, 0x00], 'Z'),
+    ([0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00], 'a'), ([0x00, 0x00, 0x7C, 0x62, 0x7E, 0x66, 0x7C, 0x00], 'b'),
+    ([0x00, 0x00, 0x3E, 0x60, 0x60, 0x66, 0x3E, 0x00], 'c'), ([0x00, 0x00, 0x1E, 0x66, 0x66, 0x66, 0x3E, 0x00], 'd'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x7E, 0x60, 0x3E, 0x00], 'e'), ([0x00, 0x10, 0x3C, 0x10, 0x30, 0x10, 0x10, 0x00], 'f'),
+    ([0x00, 0x00, 0x3E, 0x60, 0x3E, 0x66, 0x3E, 0x00], 'g'), ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00], 'h'),
+    ([0x00, 0x18, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00], 'i'), ([0x00, 0x0C, 0x00, 0x0C, 0x0C, 0x0C, 0x38, 0x00], 'j'),
+    ([0x60, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'k'), ([0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x1C, 0x00], 'l'),
+    ([0x00, 0x00, 0x76, 0x7E, 0x66, 0x66, 0x66, 0x00], 'm'), ([0x00, 0x00, 0xDC, 0x66, 0x66, 0x66, 0x66, 0x00], 'n'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00], 'o'), ([0x00, 0x00, 0x7C, 0x66, 0x7C, 0x60, 0x60, 0x00], 'p'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x3E, 0x02, 0x02, 0x00], 'q'), ([0x00, 0x00, 0x5C, 0x66, 0x60, 0x60, 0x60, 0x00], 'r'),
+    ([0x00, 0x00, 0x3E, 0x60, 0x3E, 0x06, 0x3E, 0x00], 's'), ([0x00, 0x10, 0x7C, 0x10, 0x10, 0x14, 0x18, 0x00], 't'),
+    ([0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'u'), ([0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18], 'v'),
+    ([0x00, 0x00, 0x66, 0x66, 0x7E, 0x7E, 0x66, 0x00], 'w'), ([0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00], 'x'),
+    ([0x00, 0x00, 0x66, 0x66, 0x3E, 0x06, 0x3E, 0x00], 'y'), ([0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x7E, 0x00], 'z'),
+    ([0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00], '0'), ([0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00], '1'),
+    ([0x3C, 0x66, 0x06, 0x0C, 0x30, 0x60, 0x7E, 0x00], '2'), ([0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00], '3'),
+    ([0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x0C, 0x00], '4'), ([0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00], '5'),
+    ([0x3C, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x3C, 0x00], '6'), ([0x7E, 0x66, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00], '7'),
+    ([0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00], '8'), ([0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00], '9'),
+    ([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], ' '), ([0x00, 0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00], '!'),
+    ([0x00, 0x00, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00], ':'), ([0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00], '_'),
+    ([0x00, 0x00, 0x3C, 0x42, 0x42, 0x3C, 0x00, 0x00], '.'), ([0x3A, 0x5C, 0x3A, 0x00, 0x00, 0x00, 0x00, 0x00], '>'),
+    ([0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00], '-'), ([0x00, 0x7E, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00], '='),
+    ([0x3E, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'А'), ([0x7C, 0x62, 0x66, 0x7E, 0x66, 0x66, 0x7C, 0x00], 'Б'),
+    ([0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00], 'В'), ([0x7E, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x00], 'Г'),
+    ([0x6E, 0x76, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'Д'), ([0x7E, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x7E, 0x00], 'Е'),
+    ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'Ж'), ([0x3E, 0x66, 0x06, 0x1C, 0x06, 0x3E, 0x3E, 0x00], 'З'),
+    ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'И'), ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'Й'),
+    ([0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'К'), ([0x30, 0x30, 0x30, 0x30, 0x30, 0x66, 0x66, 0x00], 'Л'),
+    ([0x66, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'М'), ([0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'Н'),
+    ([0x3E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'О'), ([0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'П'),
+    ([0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00], 'Р'), ([0x3E, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3E, 0x00], 'С'),
+    ([0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], 'Т'), ([0x66, 0x66, 0x66, 0x3E, 0x0C, 0x18, 0x70, 0x00], 'У'),
+    ([0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00], 'Ф'), ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'Х'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'Ц'), ([0x66, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x06, 0x00], 'Ч'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7E, 0x00], 'Ш'), ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'Щ'),
+    ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'Ъ'), ([0x62, 0x62, 0x7A, 0x66, 0x66, 0x66, 0x7A, 0x00], 'Ы'),
+    ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'Ь'), ([0x3E, 0x06, 0x06, 0x1E, 0x06, 0x06, 0x3E, 0x00], 'Э'),
+    ([0x46, 0x66, 0x26, 0x36, 0x66, 0x66, 0x64, 0x00], 'Ю'), ([0x3E, 0x66, 0x66, 0x3E, 0x26, 0x66, 0x66, 0x00], 'Я'),
+    ([0x00, 0x00, 0x3E, 0x66, 0x7E, 0x60, 0x3E, 0x00], 'ё'), ([0x3E, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'а'),
+    ([0x7C, 0x62, 0x66, 0x7E, 0x66, 0x66, 0x7C, 0x00], 'б'), ([0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00], 'в'),
+    ([0x7E, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x00], 'г'), ([0x6E, 0x76, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'д'),
+    ([0x7E, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x7E, 0x00], 'е'), ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'ж'),
+    ([0x3E, 0x66, 0x06, 0x1C, 0x06, 0x3E, 0x3E, 0x00], 'з'), ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'и'),
+    ([0x66, 0x6E, 0x76, 0x76, 0x6E, 0x66, 0x66, 0x00], 'й'), ([0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00], 'к'),
+    ([0x30, 0x30, 0x30, 0x30, 0x30, 0x66, 0x66, 0x00], 'л'), ([0x66, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'м'),
+    ([0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], 'н'), ([0x3E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00], 'о'),
+    ([0x7E, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00], 'п'), ([0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00], 'р'),
+    ([0x3E, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3E, 0x00], 'с'), ([0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], 'т'),
+    ([0x66, 0x66, 0x66, 0x3E, 0x0C, 0x18, 0x70, 0x00], 'у'), ([0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00], 'ф'),
+    ([0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00], 'х'), ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'ц'),
+    ([0x66, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x06, 0x00], 'ч'), ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7E, 0x00], 'ш'),
+    ([0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7F, 0x01], 'щ'), ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'ъ'),
+    ([0x62, 0x62, 0x7A, 0x66, 0x66, 0x66, 0x7A, 0x00], 'ы'), ([0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00], 'ь'),
+    ([0x3E, 0x06, 0x06, 0x1E, 0x06, 0x06, 0x3E, 0x00], 'э'), ([0x46, 0x66, 0x26, 0x36, 0x66, 0x66, 0x64, 0x00], 'ю'),
+    ([0x3E, 0x66, 0x66, 0x3E, 0x26, 0x66, 0x66, 0x00], 'я'),
+];
+pub unsafe fn draw_txt(fb: *mut u32, x: isize, y: isize, text: &str, color: u32) {
+    let c = color;
+    let mut curr_x = x;
+    for target_char in text.chars() {
+        for font_idx in 0..MAIN_FONT.len() {
+            if MAIN_FONT[font_idx].1 == target_char {
+                let bitmap = MAIN_FONT[font_idx].0;
+                for row in 0..8 {
+                    let bits = bitmap[row];
+                    if bits == 0 { continue; }
+                    for col in 0..8 {
+                        if (bits & (1 << (7 - col))) != 0 {
+                            let px = curr_x + col as isize;
+                            let py = y + row as isize;
+                            if px >= 0 && px < SCREEN_W && py >= 0 && py < SCREEN_H {
+                                *fb.offset(py * SCREEN_W + px) = c;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        curr_x += 9;
+    }
+}
+unsafe fn blend_color(bg: u32, fg: u32, alpha: u8) -> u32 {
+    let inv_alpha = 255 - alpha as u32;
+    let bg_r = (bg >> 16) & 0xFF; let bg_g = (bg >> 8) & 0xFF; let bg_b = bg & 0xFF;
+    let fg_r = (fg >> 16) & 0xFF; let fg_g = (fg >> 8) & 0xFF; let fg_b = fg & 0xFF;
+    let r = ((bg_r * inv_alpha + fg_r * alpha as u32) / 255) & 0xFF;
+    let g = ((bg_g * inv_alpha + fg_g * alpha as u32) / 255) & 0xFF;
+    let b = ((bg_b * inv_alpha + fg_b * alpha as u32) / 255) & 0xFF;
+    (r << 16) | (g << 8) | b
+}
+// ==========================================
+// 7. 3D-ИКОНКИ
+// ==========================================
+#[inline(always)]
+unsafe fn put_px(fb: *mut u32, x: isize, y: isize, c: u32) {
+    if x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H {
+        *fb.offset(y * SCREEN_W + x) = c;
+    }
+}
+unsafe fn draw_rounded_rect_3d(fb: *mut u32, x: isize, y: isize, w: isize, h: isize, radius: isize, base_top: u32, base_bot: u32) {
+    if w <= 0 || h <= 0 { return; }
+    let rt = (base_top >> 16) & 0xFF; let gt = (base_top >> 8) & 0xFF; let bt = base_top & 0xFF;
+    let rb = (base_bot >> 16) & 0xFF; let gb = (base_bot >> 8) & 0xFF; let bb = base_bot & 0xFF;
+    for dy in 0..h {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        let t = (dy as u32 * 255) / h.max(1) as u32;
+        let r = rt - (rt - rb) * t / 255;
+        let g = gt - (gt - gb) * t / 255;
+        let b = bt - (bt - bb) * t / 255;
+        let fill = (r << 16) | (g << 8) | b;
+        let highlight = if dy < h / 3 {
+            let hl_t = (dy as u32 * 100) / (h / 3).max(1) as u32;
+            blend_color(fill, 0x00FFFFFF, (50 - hl_t / 2) as u8)
+        } else { fill };
+        for dx in 0..w {
+            let px = x + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let mut skip = false;
+            if dx < radius && dy < radius {
+                let cx = radius - dx; let cy = radius - dy;
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            } else if dx > w - radius && dy < radius {
+                let cx = dx - (w - radius); let cy = radius - dy;
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            } else if dx < radius && dy > h - radius {
+                let cx = radius - dx; let cy = dy - (h - radius);
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            } else if dx > w - radius && dy > h - radius {
+                let cx = dx - (w - radius); let cy = dy - (h - radius);
+                if cx * cx + cy * cy > radius * radius { skip = true; }
+            }
+            if skip { continue; }
+            *row.offset(px) = highlight;
+        }
+    }
+}
+unsafe fn draw_icon_shadow(fb: *mut u32, cx: isize, cy: isize, rx: isize, ry: isize) {
+    for dy in -ry..=ry {
+        let py = cy + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        for dx in -rx..=rx {
+            let px = cx + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let d = (dx * dx * 100) / (rx * rx).max(1) + (dy * dy * 100) / (ry * ry).max(1);
+            if d <= 100 {
+                let alpha = ((100 - d) * 80 / 100) as u8;
+                let p = *fb.offset(py * SCREEN_W + px);
+                *fb.offset(py * SCREEN_W + px) = blend_color(p, 0x00000000, alpha);
+            }
+        }
+    }
+}
+unsafe fn icon_symbol_calc(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 6;
+    let cell = (sz - pad * 2) / 4;
+    for dy in pad..(pad + cell) { for dx in pad..(sz - pad) {
+        put_px(fb, x + dx, y + dy, blend_color(fg, 0x00FFFFFF, 180));
+    }}
+    for row in 0..3 {
+        for col in 0..3 {
+            let bx = pad + col * (cell + 1);
+            let by = pad + cell + 2 + row * (cell + 1);
+            for dy in 0..(cell - 2) { for dx in 0..(cell - 2) {
+                put_px(fb, x + bx + dx, y + by + dy, blend_color(fg, 0x00FFFFFF, 220));
+            }}
+        }
+    }
+}
+unsafe fn icon_symbol_folder(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 5;
+    let h = sz - pad * 2;
+    let w = sz - pad * 2;
+    for dy in (pad + h / 4)..(pad + h) { for dx in pad..(pad + w) {
+        put_px(fb, x + dx, y + dy, fg);
+    }}
+    for dy in pad..(pad + h / 4) { for dx in pad..(pad + w / 2) {
+        put_px(fb, x + dx, y + dy, fg);
+    }}
+}
+unsafe fn icon_symbol_gear(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let cx = sz / 2; let cy = sz / 2;
+    let r_outer = sz / 2 - 2;
+    let r_inner = sz / 4;
+    for dy in -r_outer..=r_outer {
+        for dx in -r_outer..=r_outer {
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r_outer * r_outer && d2 >= r_inner * r_inner {
+                put_px(fb, x + cx + dx, y + cy + dy, fg);
+            }
+        }
+    }
+    for dy in -r_inner..=r_inner {
+        for dx in -r_inner..=r_inner {
+            if dx * dx + dy * dy <= r_inner * r_inner {
+                put_px(fb, x + cx + dx, y + cy + dy, blend_color(fg, 0x00000000, 200));
+            }
+        }
+    }
+}
+unsafe fn icon_symbol_notepad(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 5;
+    let line_h = sz / 8;
+    for line in 0..4 {
+        let ly = pad + line * (line_h + 1);
+        for dy in 0..2 { for dx in pad..(sz - pad) {
+            put_px(fb, x + dx, y + ly + dy, fg);
+        }}
+    }
+}
+unsafe fn icon_symbol_taskman(fb: *mut u32, x: isize, y: isize, sz: isize, fg: u32) {
+    let pad = sz / 6;
+    let w = sz - pad * 2;
+    let h = sz - pad * 2;
+    for dx in 0..w { for dy in 0..2 {
+        put_px(fb, x + pad + dx, y + pad + h - 2 - dy, fg);
+    }}
+    for dy in 0..h { for dx in 0..2 {
+        put_px(fb, x + pad + dx, y + pad + dy, fg);
+    }}
+    let bars = [h * 3 / 4, h * 1 / 2, h * 2 / 3];
+    for (i, &bh) in bars.iter().enumerate() {
+        let bx = pad + 4 + (i as isize) * (w / 4);
+        for dy in 0..bh { for dx in 0..(w / 6) {
+            put_px(fb, x + bx + dx, y + pad + h - 2 - dy, fg);
+        }}
+    }
+}
+unsafe fn draw_icon_3d(fb: *mut u32, x: isize, y: isize, sz: isize, base_top: u32, base_bot: u32, symbol: u8, fg: u32) {
+    draw_icon_shadow(fb, x + sz / 2 + 3, y + sz + 2, sz / 2, sz / 6);
+    let radius = sz / 6;
+    draw_rounded_rect_3d(fb, x, y, sz, sz, radius, base_top, base_bot);
+    let pad = sz / 4;
+    let inner = sz / 2;
+    let sx = x + pad;
+    let sy = y + pad;
+    match symbol {
+        0 => icon_symbol_calc(fb, sx, sy, inner, fg),
+        1 => icon_symbol_folder(fb, sx, sy, inner, fg),
+        2 => icon_symbol_gear(fb, sx, sy, inner, fg),
+        3 => icon_symbol_notepad(fb, sx, sy, inner, fg),
+        4 => icon_symbol_taskman(fb, sx, sy, inner, fg),
+        _ => {}
+    }
+}
+pub unsafe fn draw_calc_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00E8503A, 0x00A02020, 0, 0x00FFFFFF); }
+pub unsafe fn draw_folder_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00F5B942, 0x00C07818, 1, 0x00A05000); }
+pub unsafe fn draw_settings_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00C8D0D8, 0x00707880, 2, 0x00384048); }
+pub unsafe fn draw_notepad_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x0050A0E8, 0x002060A0, 3, 0x00FFFFFF); }
+pub unsafe fn draw_taskman_icon(fb: *mut u32, x: isize, y: isize) { draw_icon_3d(fb, x, y, icon_size(), 0x00D04040, 0x00801818, 4, 0x00FFFFFF); }
+pub unsafe fn draw_browser_icon(fb: *mut u32, x: isize, y: isize) {
+    let sz = icon_size();
+    draw_icon_3d(fb, x, y, sz, 0x0040A0E0, 0x002060A0, 3, 0x00FFFFFF);
+    if net_link_up() {
+        let cx = x + sz - 8;
+        let cy = y + 8;
+        for dy in -4..=4 {
+            for dx in -4..=4 {
+                if dx * dx + dy * dy <= 16 { put_px(fb, cx + dx, cy + dy, 0x0000FF00); }
+            }
+        }
+    }
+}
+unsafe fn draw_icon_label_3d(fb: *mut u32, x: isize, y: isize, text: &str, color: u32) {
+    draw_txt(fb, x + 1, y + 1, text, 0x00000000);
+    draw_txt(fb, x, y, text, color);
+}
+// ==========================================
+// 8. AERO + КНОПКИ
+// ==========================================
+unsafe fn draw_aero_window(fb: *mut u32, x: isize, y: isize, width: isize, height: isize, _anim_progress: u8) {
+    if anim_progress == 0 || width <= 0 || height <= 0 { return; }
+    let (, _, accent, accent_dark, _, _) = theme_colors();
+    let panel = 0x00F0F0F0u32;
+    for dy in 30..(height - 4) {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 4..(width - 4) {
+            let px = x + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let p = *row.offset(px);
+            *row.offset(px) = blend_color(p, panel, 230);
+        }
+    }
+    for dx in 0..width {
+        let px = x + dx;
+        if px < 0 || px >= SCREEN_W { continue; }
+        for t in 0..3 {
+            let py1 = y + t;
+            if py1 >= 0 && py1 < SCREEN_H { *fb.offset(py1 * SCREEN_W + px) = blend_color(*fb.offset(py1 * SCREEN_W + px), accent, 220); }
+            let py2 = y + height - 1 - t;
+            if py2 >= 0 && py2 < SCREEN_H { *fb.offset(py2 * SCREEN_W + px) = blend_color(*fb.offset(py2 * SCREEN_W + px), accent_dark, 220); }
+        }
+    }
+    for dy in 0..height {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        for t in 0..3 {
+            let px1 = x + t;
+            if px1 >= 0 && px1 < SCREEN_W { *fb.offset(py * SCREEN_W + px1) = blend_color(*fb.offset(py * SCREEN_W + px1), accent, 220); }
+            let px2 = x + width - 1 - t;
+            if px2 >= 0 && px2 < SCREEN_W { *fb.offset(py * SCREEN_W + px2) = blend_color(*fb.offset(py * SCREEN_W + px2), accent_dark, 220); }
+        }
+    }
+}
+unsafe fn draw_aero_titlebar(fb: *mut u32, x: isize, y: isize, w: isize, title: &str, anim: u8) {
+    if anim == 0 { return; }
+    let alpha = ((anim as u32) * 230 / 100) as u8;
+    let (_, _, accent, accent_dark, txt_dark, _) = theme_colors();
+    let ar = (accent >> 16) & 0xFF; let ag = (accent >> 8) & 0xFF; let ab = accent & 0xFF;
+    for dy in 0..26 {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let t = (dy as u32 * 100) / 26;
+        let aero = ((ar - (t * ar) / 200) << 16) | ((ag - (t * ag) / 200) << 8) | (ab - (t * ab) / 200);
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..w {
+            let px = x + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            *row.offset(px) = blend_color(*row.offset(px), aero, alpha);
+        }
+    }
+    draw_txt(fb, x + 10, y + 7, title, txt_dark);
+    draw_txt(fb, x + 9, y + 6, title, 0x00FFFFFF);
+    let bx = x + w - 78;
+    draw_aero_button(fb, bx, y + 5, 22, "—", blend_color(accent, 0x00FFFFFF, 60), txt_dark);
+    draw_aero_button(fb, bx + 24, y + 5, 22, "□", blend_color(accent, 0x00FFFFFF, 60), txt_dark);
+    draw_aero_button(fb, bx + 48, y + 5, 22, "×", blend_color(accent_dark, 0x00000000, 40), 0x00FFFFFF);
+}
+unsafe fn draw_aero_button(fb: *mut u32, x: isize, y: isize, s: isize, sym: &str, bg: u32, fg: u32) {
+    for dy in 0..s {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let t = (dy as u32 * 60) / s as u32;
+        let btn = blend_color(bg, 0x0
+        0FFFFFF, (60 - t) as u8);
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..s {
+            let px = x + dx;
+            if px >= 0 && px < SCREEN_W { *row.offset(px) = btn; }
+        }
+    }
+    draw_txt(fb, x + 7, y + 6, sym, fg);
+}
+WM.is_settings_open = false; WM.is_notepad_open = false;
+WM.is_console_open = false; WM.is_taskman_open = false;
+WM.is_browser_open = false;
+}
+return;
+}
+0x1C => {
+    if WM.is_console_open && !WM.console_minimized {
+        let mut temp_cmd = [0u8; 65];
+        for i in 0..CONSOLE_TEXT_LEN { temp_cmd[i] = CONSOLE_TEXT[i]; }
+        if let Ok(cmd_str) = core::str::from_utf8(&temp_cmd[..CONSOLE_TEXT_LEN]) {
+            if cmd_str == "help" { CONSOLE_RESPONSE = "Commands: help, clear, echo, exit"; }
+            else if cmd_str == "clear" { CONSOLE_RESPONSE = ""; ECHO_LEN = 0; }
+            else if cmd_str.starts_with("echo ") {
+                ECHO_LEN = 0;
+                let bytes = cmd_str.as_bytes();
+                for i in 5..bytes.len() { if ECHO_LEN < 64 { ECHO_BUFFER[ECHO_LEN] = bytes[i]; ECHO_LEN += 1; } }
+                CONSOLE_RESPONSE = core::str::from_utf8(&ECHO_BUFFER[..ECHO_LEN]).unwrap_or("Error");
+            } else if cmd_str == "exit" { WM.is_console_open = false; }
+            else { CONSOLE_RESPONSE = "Unknown command."; }
+        }
+        CONSOLE_TEXT_LEN = 0;
+        return;
+    }
+}
+_ => {}
+}
+if WM.is_console_open && !WM.console_minimized {
+    if scancode == 0x0E { if CONSOLE_TEXT_LEN > 0 { CONSOLE_TEXT_LEN -= 1; CONSOLE_TEXT[CONSOLE_TEXT_LEN] = 0; } }
+    else {
+        let ascii = scancode_to_char(scancode);
+        if ascii != '\0' && CONSOLE_TEXT_LEN < 60 { CONSOLE_TEXT[CONSOLE_TEXT_LEN] = ascii as u8; CONSOLE_TEXT_LEN += 1; }
+    }
+}
+if WM.is_notepad_open && !WM.notepad_minimized {
+    if scancode == 0x0E { if NOTEPAD_TEXT_LEN > 0 { NOTEPAD_TEXT_LEN -= 1; NOTEPAD_TEXT[NOTEPAD_TEXT_LEN] = 0; } }
+    else {
+        let ascii = scancode_to_char(scancode);
+        if ascii != '\0' && NOTEPAD_TEXT_LEN < 250 { NOTEPAD_TEXT[NOTEPAD_TEXT_LEN] = ascii as u8; NOTEPAD_TEXT_LEN += 1; }
+    }
+}
+}
+unsafe fn scancode_to_char(scancode: u8) -> char {
+    let shift = WM.shift_pressed || WM.caps_lock;
+    match scancode {
+        0x02 => if shift { '!' } else { '1' }, 0x03 => if shift { '@' } else { '2' },
+        0x04 => if shift { '#' } else { '3' }, 0x05 => if shift { '$' } else { '4' },
+        0x06 => if shift { '%' } else { '5' }, 0x07 => if shift { '^' } else { '6' },
+        0x08 => if shift { '&' } else { '7' }, 0x09 => if shift { '*' } else { '8' },
+        0x0A => if shift { '(' } else { '9' }, 0x0B => if shift { ')' } else { '0' },
+        0x0C => if shift { '_' } else { '-' }, 0x0D => if shift { '+' } else { '=' },
+        0x1E => if shift { 'A' } else { 'a' }, 0x30 => if shift { 'B' } else { 'b' },
+        0x2E => if shift { 'C' } else { 'c' }, 0x20 => if shift { 'D' } else { 'd' },
+        0x12 => if shift { 'E' } else { 'e' }, 0x21 => if shift { 'F' } else { 'f' },
+        0x22 => if shift { 'G' } else { 'g' }, 0x23 => if shift { 'H' } else { 'h' },
+        0x17 => if shift { 'I' } else { 'i' }, 0x24 => if shift { 'J' } else { 'j' },
+        0x25 => if shift { 'K' } else { 'k' }, 0x26 => if shift { 'L' } else { 'l' },
+        0x32 => if shift { 'M' } else { 'm' }, 0x31 => if shift { 'N' } else { 'n' },
+        0x18 => if shift { 'O' } else { 'o' }, 0x19 => if shift { 'P' } else { 'p' },
+        0x10 => if shift { 'Q' } else { 'q' }, 0x13 => if shift { 'R' } else { 'r' },
+        0x1F => if shift { 'S' } else { 's' }, 0x14 => if shift { 'T' } else { 't' },
+        0x16 => if shift { 'U' } else { 'u' }, 0x2F => if shift { 'V' } else { 'v' },
+        0x11 => if shift { 'W' } else { 'w' }, 0x2D => if shift { 'X' } else { 'x' },
+        0x15 => if shift { 'Y' } else { 'y' }, 0x2C => if shift { 'Z' } else { 'z' },
+        0x39 => ' ', 0x33 => ',', 0x34 => '.', 0x35 => '/', 0x27 => ';',
+        _ => '\0',
+    }
+}
+// ==========================================
+// 12. ФОН
+// ==========================================
+unsafe fn draw_background(fb: *mut u32) {
+    let use_bmp = WALLPAPER_ADDR != 0 && WALLPAPER_SIZE > 0;
+    let bmp_key: u8 = if use_bmp { 1 } else { 0 };
+    if BG_CACHE_THEME == THEME_ID && BG_CACHE_BRIGHT == BRIGHTNESS && BG_CACHE_BMP == bmp_key {
+        let src = (*ptr::addr_of_mut!(BG_BUFFER)).data.as_ptr() as *const u64;
+        let dst = fb as *mut u64;
+        fast_copy_qwords(dst, src, (SCREEN_W * SCREEN_H) as usize / 2);
+        return;
+    }
+    let bg = (*ptr::addr_of_mut!(BG_BUFFER)).data.as_mut_ptr();
+    let mut bmp_ok = false;
+    if use_bmp { bmp_ok = try_draw_wallpaper_bmp(bg); }
+    if !bmp_ok {
+        let (bg_top, bg_bot, _, _, _, _) = theme_colors();
+        let r1 = (bg_top >> 16) & 0xFF; let g1 = (bg_top >> 8) & 0xFF; let b1 = bg_top & 0xFF;
+        let r2 = (bg_bot >> 16) & 0xFF; let g2 = (bg_bot >> 8) & 0xFF; let b2 = bg_bot & 0xFF;
+        for y in 0..SCREEN_H {
+            let t = (y as u32 * 255) / SCREEN_H as u32;
+            let r = r1 - (r1 - r2) * t / 255;
+            let g = g1 - (g1 - g2) * t / 255;
+            let b = b1 - (b1 - b2) * t / 255;
+            let row = bg.offset(y * SCREEN_W);
+            for x in 0..SCREEN_W {
+                let ray = if ((x as u32 + y as u32 * 2) % 384) < 3 { 0x0A } else { 0 };
+                let c = (((r + ray) << 16) | ((g + ray) << 8) | (b + ray)) & 0x00FFFFFF;
+                *row.offset(x) = c;
+            }
+        }
+    }
+    BG_CACHE_THEME = THEME_ID;
+    BG_CACHE_BRIGHT = BRIGHTNESS;
+    BG_CACHE_BMP = bmp_key;
+    let src = bg as *const u64;
+    let dst = fb as *mut u64;
+    fast_copy_qwords(dst, src, (SCREEN_W * SCREEN_H) as usize / 2);
+}
+// ==========================================
+// 13. КУРСОР
+// ==========================================
+unsafe fn cursor_save_bg(mx: isize, my: isize) {
+    let back = (*ptr::addr_of_mut!(BACK_BUFFER)).data.as_ptr();
+    let save = (*ptr::addr_of_mut!(CURSOR_SAVE)).data.as_mut_ptr();
+    for dy in 0..CURSOR_H {
+        let py = my + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        for dx in 0..CURSOR_W {
+            let px = mx + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let idx = (dy * CURSOR_W + dx) as usize;
+            *save.add(idx) = *back.offset(py * SCREEN_W + px);
+        }
+    }
+    CURSOR_SAVED = true;
+    CURSOR_SAVE_X = mx;
+    CURSOR_SAVE_Y = my;
+}
+unsafe fn cursor_restore_bg() {
+    if !CURSOR_SAVED { return; }
+    let back = (*ptr::addr_of_mut!(BACK_BUFFER)).data.as_mut_ptr();
+    let save = (*ptr::addr_of_mut!(CURSOR_SAVE)).data.as_ptr();
+    for dy in 0..CURSOR_H {
+        let py = CURSOR_SAVE_Y + dy;
+        if py < 0 || py >= SCREEN_H { continue; }
+        for dx in 0..CURSOR_W {
+            let px = CURSOR_SAVE_X + dx;
+            if px < 0 || px >= SCREEN_W { continue; }
+            let idx = (dy * CURSOR_W + dx) as usize;
+            *back.offset(py * SCREEN_W + px) = *save.add(idx);
+        }
+    }
+    CURSOR_SAVED = false;
+}
+unsafe fn draw_cursor(fb: *mut u32, mx: isize, my: isize) {
+    const CUR: [[u8; 12]; 19] = [, [2,2,0,0,0,0,0,0,0,0,0,0],
+    , [2,1,1,2,0,0,0,0,0,0,0,0],
+    , [2,1,1,1,1,2,0,0,0,0,0,0],
+    , [2,1,1,1,1,1,1,2,0,0,0,0],
+    , [2,1,1,1,1,1,1,1,1,2,0,0],
+    , [2,1,1,1,2,1,1,2,0,0,0,0],
+    , [2,2,0,0,2,1,1,2,0,0,0,0],
+    , [0,0,0,0,0,2,1,1,2,0,0,0],
+    , [0,0,0,0,0,0,2,1,1,2,0,0],
+    ,
+    ];
+    for i in 0..19 {
+        let py = my + i as isize;
+        if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        for j in 0..12 {
+            let v = CUR[i][j];
+            if v == 0 { continue; }
+            let px = mx + j as isize;
+            if px < 0 || px >= SCREEN_W { continue; }
+            *row.offset(px) = if v == 1 { 0x00FFFFFF } else { 0x00000000 };
+        }
+    }
+}
+// ==========================================
+// 14. СТАРТ, ТАСКБАР, МЕНЮ
+// ==========================================
+unsafe fn draw_start_orb(fb: *mut u32, cx: isize, cy: isize, hovered: bool) {
+    let r = 18isize; let r2 = (r * r) as u32;
+    let (_, _, accent, accent_dark, _, _) = theme_colors();
+    let ar = ((accent >> 16) & 0xFF) as u32; let ag = ((accent >> 8) & 0xFF) as u32; let ab = (accent & 0xFF) as u32;
+    let boost = if hovered { 25u32 } else { 0 };
+    for dy in -r..=r {
+        let py = cy + dy; if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        for dx in -r..=r {
+            let px = cx + dx; if px < 0 || px >= SCREEN_W { continue; }
+            let d2 = (dx * dx + dy * dy) as u32;
+            if d2 <= r2 {
+                let dist = d2 * 100 / r2;
+                let r_c = ar.saturating_sub(dist * ar / 130);
+                let g_c = ag.saturating_sub(dist * ag / 130);
+                let b_c = ab.saturating_sub(dist * ab / 130);
+                *row.offset(px) = ((r_c + boost) << 16) | ((g_c + boost) << 8) | (b_c + boost);
+            }
+        }
+    }
+    for dy in -r..=r {
+        let py = cy + dy; if py < 0 || py >= SCREEN_H { continue; }
+        for dx in -r..=r {
+            let px = cx + dx; if px < 0 || px >= SCREEN_W { continue; }
+            let d2 = dx * dx + dy * dy;
+            if d2 > (r - 1) * (r - 1) && d2 <= r * r { *fb.offset(py * SCREEN_W + px) = accent_dark; }
+        }
+    }
+}
+unsafe fn draw_taskbar(fb: *mut u32) {
+    let bar_y = SCREEN_H - 40;
+    let (_, _, accent, _, _, _) = theme_colors();
+    for y in bar_y..SCREEN_H {
+        let t = ((y - bar_y) as u32 * 255) / 40;
+        let r = 42 - (t * 10 / 255); let g = 42 - (t * 14 / 255); let b = 44 - (t * 16 / 255);
+        let base = (r << 16) | (g << 8) | b;
+        let row = fb.offset(y * SCREEN_W);
+        for x in 0..SCREEN_W { *row.offset(x) = base; }
+    }
+    let top_row = fb.offset(bar_y * SCREEN_W);
+    for x in 0..SCREEN_W { *top_row.offset(x) = accent; }
+    let hovered = check_bounds(WM.mouse_x, WM.mouse_y, 5, bar_y + 2, 40, 36);
+    draw_start_orb(fb, 25, bar_y + 20, hovered);
+    if SHOW_CLOCK {
+        draw_txt(fb, SCREEN_W - 65, bar_y + 8, "12:00", 0x00FFFFFF);
+        draw_txt(fb, SCREEN_W - 65, bar_y + 22, "01.01.2024", 0x00E0A0A0);
+    }
+    if net_link_up() {
+        for dy in 0..12 { for dx in 0..12 {
+            put_px(fb, SCREEN_W - 30 + dx, bar_y + 14 + dy, 0x0000CC00);
+        }}
+        draw_txt(fb, SCREEN_W - 90, bar_y + 12, "NET", 0x0000FF00);
+    } else {
+        for dy in 0..12 { for dx in 0..12 {
+            put_px(fb, SCREEN_W - 30 + dx, bar_y + 14 + dy, 0x00CC0000);
+        }}
+        draw_txt(fb, SCREEN_W - 90, bar_y + 12, "NET", 0x00FF0000);
+    }
+}
+unsafe fn draw_start_menu(fb: *mut u32, anim: u8) {
+    if anim == 0 { return; }
+    let mw: isize = 420; let mh: isize = 540;
+    let m_x: isize = 5; let m_y: isize = SCREEN_H - 40 - (mh * anim as isize / 100);
+    let (_, _, accent, accent_dark, txt_dark, _) = theme_colors();
+    draw_aero_window(fb, m_x, m_y, mw, mh, anim);
+    for dy in 0..64 {
+        let py = m_y + dy; if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..mw {
+            let px = m_x + dx; if px < 0 || px >= SCREEN_W { continue; }
+            let p = *row.offset(px);
+            *row.offset(px) = blend_color(p, blend_color(accent, 0x00FFFFFF, 180), 230);
+        }
+    }
+    draw_txt(fb, m_x + 20, m_y + 20, "midenOS 8.1", accent_dark);
+    for dx in 0..mw { *fb.offset((m_y + 64) * SCREEN_W + m_x + dx) = accent; }
+    let items = ["Калькулятор", "Проводник", "Настройки", "Блокнот", "Терминал", "Диспетчер задач"];
+    let mut iy = m_y + 72;
+    for (i, item) in items.iter().enumerate() {
+        let hover = check_bounds(WM.mouse_x, WM.mouse_y, m_x + 4, iy, 260, 32);
+        let bg = if hover { blend_color(accent, 0x00FFFFFF, 150) } else { 0x00FFFFFF };
+        for dy in 0..32 {
+            let py = iy + dy; if py < 0 || py >= SCREEN_H { continue; }
+            let row = fb.offset(py * SCREEN_W);
+            for dx in 0..260 {
+                let px = m_x + 4 + dx; if px < 0 || px >= SCREEN_W { continue; }
+                let p = *row.offset(px);
+                *row.offset(px) = blend_color(p, bg, if hover { 200 } else { 40 });
+            }
+        }
+        match i {
+            0 => draw_calc_icon(fb, m_x + 8, iy + 4),
+            1 => draw_folder_icon(fb, m_x + 8, iy + 4),
+            2 => draw_settings_icon(fb, m_x + 8, iy + 4),
+            3 => draw_notepad_icon(fb, m_x + 8, iy + 4),
+            5 => draw_taskman_icon(fb, m_x + 8, iy + 4),
+            _ => {}
+        }
+        draw_txt(fb, m_x + 42, iy + 12, item, txt_dark);
+        iy += 36;
+    }
+    let shutdown_hover = check_bounds(WM.mouse_x, WM.mouse_y, m_x + 4, m_y + mh - 38, 260, 30);
+    let sh_bg = if shutdown_hover { 0x00D64638 } else { blend_color(accent, 0x00FFFFFF, 220) };
+    for dy in 0..30 {
+        let py = m_y + mh - 38 + dy; if py < 0 || py >= SCREEN_H { continue; }
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..260 {
+            let px = m_x + 4 + dx;
+            if px >= 0 && px < SCREEN_W { *row.offset(px) = sh_bg; }
+        }
+    }
+    draw_txt(fb, m_x + 14, m_y + mh - 30, "Выключение", if shutdown_hover { 0x00FFFFFF } else { txt_dark });
+}
+// ==========================================
+// 15. МЫШЬ
+// ==========================================
+static mut MOUSE_CYCLE: u8 = 0;
+static mut MOUSE_BYTE0: u8 = 0;
+static mut MOUSE_BYTE1: u8 = 0;
+static mut MOUSE_BYTE2: u8 = 0;
+unsafe fn mouse_wait_write() { let mut t = 100_000u32; while t > 0 { if (inb(0x64) & 0x02) == 0 { return; } t -= 1; } }
+unsafe fn mouse_wait_read() { let mut t = 100_000u32; while t > 0 { if (inb(0x64) & 0x01) != 0 { return; } t -= 1; } }
+unsafe fn mouse_cmd(byte: u8) { mouse_wait_write(); outb(0x64, 0xD4); mouse_wait_write(); outb(0x60, byte); }
+unsafe fn mouse_read() -> u8 { mouse_wait_read(); inb(0x60) }
+unsafe fn init_ps2_mouse() {
+    mouse_wait_write(); outb(0x64, 0xA8);
+    mouse_wait_write(); outb(0x64, 0x20);
+    mouse_wait_read(); let mut cfg = inb(0x60);
+    cfg &= !0x20; cfg &= !0x02;
+    mouse_wait_write(); outb(0x64, 0x60);
+    mouse_wait_write(); outb(0x60, cfg);
+    mouse_cmd(0xF6); let _ = mouse_read();
+    mouse_cmd(0xF4); let _ = mouse_read();
+    MOUSE_CYCLE = 0;
+}
+unsafe fn poll_mouse_event_from_byte(byte: u8) {
+    match MOUSE_CYCLE {
+        0 => { MOUSE_BYTE0 = byte; if (byte & 0x08) != 0 { MOUSE_CYCLE = 1; } }
+        1 => { MOUSE_BYTE1 = byte; MOUSE_CYCLE = 2; }
+        2 => {
+            MOUSE_BYTE2 = byte; MOUSE_CYCLE = 0;
+            let b0 = MOUSE_BYTE0; let b1 = MOUSE_BYTE1; let b2 = MOUSE_BYTE2;
+            if (b0 & 0x40) != 0 || (b0 & 0x80) != 0 { return; }
+            let mul = cursor_speed_mul();
+            let dx = (b1 as i8 as isize) * mul;
+            let dy = (b2 as i8 as isize) * mul;
+            WM.mouse_x += dx; WM.mouse_y -= dy;
+            if WM.mouse_x < 0 { WM.mouse_x = 0; }
+            if WM.mouse_x > SCREEN_W - 2 { WM.mouse_x = SCREEN_W - 2; }
+            if WM.mouse_y < 0 { WM.mouse_y = 0; }
+            if WM.mouse_y > SCREEN_H - 2 { WM.mouse_y = SCREEN_H - 2; }
+            let left = (b0 & 0x01) != 0; let right = (b0 & 0x02) != 0;
+            if left && !WM.mouse_pressed { WM.mouse_pressed = true; }
+            else if !left { WM.mouse_pressed = false; }
+            WM.mouse_right_pressed = right;
+        }
+        _ => MOUSE_CYCLE = 0,
+    }
+}
+// ==========================================
+// 16. КНОПКИ ЗАГОЛОВКА
+// ==========================================
+unsafe fn try_close_buttons(mx: isize, my: isize) -> bool {
+    if WM.is_calc_open && WM.calc_anim > 50 {
+        let w = 320 * WM.calc_anim as isize / 100;
+        let bx = CALC_X + w - 78;
+        if check_bounds(mx, my, bx + 48, CALC_Y + 5, 22, 22) { WM.is_calc_open = false; WM.calc_anim = 0; return true; }
+        if check_bounds(mx, my, bx, CALC_Y + 5, 22, 22) { WM.calc_minimized = true; return true; }
+    }
+    if WM.is_explorer_open && WM.explorer_anim > 50 {
+        let w = 520 * WM.explorer_anim as isize / 100;
+        let bx = EXPLORER_X + w - 78;
+        if check_bounds(mx, my, bx + 48, EXPLORER_Y + 5, 22, 22) { WM.is_explorer_open = false; WM.explorer_anim = 0; return true; }
+        if check_bounds(mx, my, bx, EXPLORER_Y + 5, 22, 22) { WM.explorer_minimized = true; return true; }
+    }
+    if WM.is_settings_open && WM.settings_anim > 50 {
+        let w = 470 * WM.settings_anim as isize / 100;
+        let bx = SETTINGS_X + w - 78;
+        if check_bounds(mx, my, bx + 48, SETTINGS_Y + 5, 22, 22) { WM.is_settings_open = false; WM.settings_anim = 0; return true; }
+        if check_bounds(mx, my, bx, SETTINGS_Y + 5, 22, 22) { WM.settings_minimized = true; return true; }
+    }
+    if WM.is_notepad_open && WM.notepad_anim > 50 {
+        let w = 520 * WM.notepad_anim as isize / 100;
+        let bx = NOTEPAD_X + w - 78;
+        if check_bounds(mx, my, bx + 48, NOTEPAD_Y + 5, 22, 22) { WM.is_notepad_open = false; WM.notepad_anim = 0; return true; }
+        if check_bounds(mx, my, bx, NOTEPAD_Y + 5, 22, 22) { WM.notepad_minimized = true; return true; }
+    }
+    if WM.is_console_open && WM.console_anim > 50 {
+        let w = 620 * WM.console_anim as isize / 100;
+        let bx = CONSOLE_X + w - 78;
+        if check_bounds(mx, my, bx + 48, CONSOLE_Y + 5, 22, 22) { WM.is_console_open = false; WM.console_anim = 0; return true; }
+        if check_bounds(mx, my, bx, CONSOLE_Y + 5, 22, 22) { WM.console_minimized = true; return true; }
+    }
+    if WM.is_taskman_open && WM.taskman_anim > 50 {
+        let w = 400 * WM.taskman_anim as isize / 100;
+        let bx = TASKMAN_X + w - 78;
+        if check_bounds(mx, my, bx + 48, TASKMAN_Y + 5, 22, 22) { WM.is_taskman_open = false; WM.taskman_anim = 0; return true; }
+        if check_bounds(mx, my, bx, TASKMAN_Y + 5, 22, 22) { WM.taskman_minimized = true; return true; }
+    }
+    if WM.is_browser_open && WM.browser_anim > 50 {
+        let w = 600 * WM.browser_anim as isize / 100;
+        let bx = BROWSER_X + w - 78;
+        if check_bounds(mx, my, bx + 48, BROWSER_Y + 5, 22, 22) { WM.is_browser_open = false; WM.browser_anim = 0; return true; }
+        if check_bounds(mx, my, bx, BROWSER_Y + 5, 22, 22) { WM.browser_minimized = true; return true; }
+    }
+    false
+}
+// ==========================================
+// 17. СОДЕРЖИМОЕ ПРИЛОЖЕНИЙ
+// ==========================================
+unsafe fn draw_calc_content(fb: *mut u32, x: isize, y: isize) {
+    for dy in 40..90 { for dx in 10..310 { *fb.offset((y + dy) * SCREEN_W + x + dx) = 0x00FFFFFF; } }
+    draw_txt(fb, x + 20, y + 55, "0", 0x00000000);
+    let labels = ["7","8","9","4","5","6","1","2","3","+","0","="];
+    let mut idx = 0;
+    for row in 0..4 {
+        for col in 0..3 {
+            let bx = x + 10 + col * 100;
+            let by = y + 100 + row * 65;
+            for dy in 0..55 { for dx in 0..90 { *fb.offset((by + dy) * SCREEN_W + bx + dx) = 0x00E0E0E0; } }
+            if idx < 12 { draw_txt(fb, bx + 35, by + 20, labels[idx], 0x00000000); }
+            idx += 1;
+        }
+    }
+}
+unsafe fn draw_explorer_content(fb: *mut u32, x: isize, y: isize) {
+    let (_, _, accent, _, txt, _) = theme_colors();
+    draw_txt(fb, x + 20, y + 40, "Документы", txt);
+    draw_txt(fb, x + 20, y + 70, "Изображения", txt);
+    draw_txt(fb, x + 20, y + 100, "Музыка", txt);
+    draw_txt(fb, x + 20, y + 130, "Загрузки", txt);
+    for dy in 35..400 { *fb.offset((y + dy) * SCREEN_W + x + 200) = accent; }
+    draw_txt(fb, x + 220, y + 40, "Содержимое:", txt);
+    draw_txt(fb, x + 220, y + 70, "readme.txt", txt);
+    draw_txt(fb, x + 220, y + 100, "config.ini", txt);
+    draw_txt(fb, x + 220, y + 130, "notes.md", txt);
+}
+unsafe fn draw_notepad_content(fb: *mut u32, x: isize, y: isize) {
+    let (_, _, _, _, txt, _) = theme_colors();
+    let mut temp = [0u8; 257];
+    for i in 0..NOTEPAD_TEXT_LEN { temp[i] = NOTEPAD_TEXT[i]; }
+    if let Ok(s) = core::str::from_utf8(&temp[..NOTEPAD_TEXT_LEN]) { draw_txt(fb, x + 20, y + 40, s, txt); }
+    CURSOR_BLINK = CURSOR_BLINK.wrapping_add(1);
+    if (CURSOR_BLINK / 30) % 2 == 0 {
+        let cx = x + 20 + NOTEPAD_TEXT_LEN as isize * 9;
+        for dy in 0..12 { for dx in 0..2 { *fb.offset((y + 40 + dy) * SCREEN_W + cx + dx) = txt; } }
+    }
+}
+unsafe fn draw_console_content(fb: *mut u32, x: isize, y: isize) {
+    let (_, _, accent, _, _, _) = theme_colors();
+    for dy in 32..400 { for dx in 6..614 { *fb.offset((y + dy) * SCREEN_W + x + dx) = 0x000A0A14; } }
+    draw_txt(fb, x + 15, y + 45, CONSOLE_RESPONSE, accent);
+    draw_txt(fb, x + 15, y + 80, "midenOS# ", 0x00FFFFFF);
+    let mut temp = [0u8; 65];
+    for i in 0..CONSOLE_TEXT_LEN { temp[i] = CONSOLE_TEXT[i]; }
+    if let Ok(s) = core::str::from_utf8(&temp[..CONSOLE_TEXT_LEN]) { draw_txt(fb, x + 95, y + 80, s, 0x00FFFFFF); }
+}
+unsafe fn draw_browser_content(fb: *mut u32, x: isize, y: isize) {
+    let (_, _, _, _, txt, _) = theme_colors();
+    draw_txt(fb, x + 20, y + 50,
+             if net_link_up() { "Сеть: ПОДКЛЮЧЕНА" } else { "Сеть: ОТКЛЮЧЕНА" },
+                 if net_link_up() { 0x0000AA00 } else { 0x00AA0000 });
+    draw_txt(fb, x + 20, y + 90, "Браузер на C будет здесь", txt);
+    draw_txt(fb, x + 20, y + 120, "Драйвер e1000: C-файл", txt);
+    if net_link_up() { draw_txt(fb, x + 20, y + 160, "e1000_init() = OK", 0x0000AA00); }
+    else { draw_txt(fb, x + 20, y + 160, "e1000_init() = FAIL", 0x00AA0000); }
+}
+unsafe fn draw_taskman_content(fb: *mut u32, x: isize, y: isize) {
+    let (_, _, _, _, txt, _) = theme_colors();
+    draw_txt(fb, x + 20, y + 40, "Процессы (окна):", txt);
+    let mut iy = y + 70;
+    if WM.is_calc_open { draw_txt(fb, x + 20, iy, "Калькулятор", txt); draw_txt(fb, x + 200, iy, "128 KB", txt); iy += 25; }
+    if WM.is_explorer_open { draw_txt(fb, x + 20, iy, "Проводник", txt); draw_txt(fb, x + 200, iy, "256 KB", txt); iy += 25; }
+    if WM.is_settings_open { draw_txt(fb, x + 20, iy, "Настройки", txt); draw_txt(fb, x + 200, iy, "64 KB", txt); iy += 25; }
+    if WM.is_notepad_open { draw_txt(fb, x + 20, iy, "Блокнот", txt); draw_txt(fb, x + 200, iy, "192 KB", txt); iy += 25; }
+    if WM.is_console_open { draw_txt(fb, x + 20, iy, "Терминал", txt); draw_txt(fb, x + 200, iy, "256 KB", txt); iy += 25; }
+    if WM.is_taskman_open { draw_txt(fb, x + 20, iy, "Диспетчер", txt); draw_txt(fb, x + 200, iy, "128 KB", txt); iy += 25; }
+    if WM.is_browser_open { draw_txt(fb, x + 20, iy, "Браузер", txt); draw_txt(fb, x + 200, iy, "512 KB", txt); }
+}
+unsafe fn handle_settings_click(mx: isize, my: isize, sx: isize, sy: isize) -> bool {
+    let w = 470 * WM.settings_anim as isize / 100;
+    let h = 370 * WM.settings_anim as isize / 100;
+    if !check_bounds(mx, my, sx + 4, sy + 30, w - 8, h - 34) { return false; }
+    let tab_x = sx + 10;
+    let mut ty = sy + 40;
+    for i in 0..7 {
+        if check_bounds(mx, my, tab_x, ty, 130, 28) { WM.settings_tab = i as u8; return true; }
+        ty += 30;
+    }
+    let cx = sx + 160;
+    let cy = sy + 40;
+    match WM.settings_tab {
+        0 => {
+            let mut by = cy + 30;
+            for i in 0..5 {
+                if check_bounds(mx, my, cx, by, 260, 28) { THEME_ID = i as u8; CACHE_VALID = false; return true; }
+                by += 32;
+            }
+        }
+        1 => {
+            let mut by = cy + 30;
+            for i in 0..3 {
+                if check_bounds(mx, my, cx, by, 200, 28) { CURSOR_SPEED = i as u8; return true; }
+                by += 32;
+            }
+        }
+        2 => {
+            let mut by = cy + 30;
+            for i in 0..3 {
+                if check_bounds(mx, my, cx, by, 200, 28) { BRIGHTNESS = i as u8; CACHE_VALID = false; return true; }
+                by += 32;
+            }
+        }
+        3 => {
+            let mut by = cy + 30;
+            for i in 0..3 {
+                if check_bounds(mx, my, cx, by, 200, 28) { ICON_SIZE = i as u8; return true; }
+                by += 32;
+            }
+        }
+        4 => { if check_bounds(mx, my, cx, cy + 30, 200, 28) { SHOW_CLOCK = !SHOW_CLOCK; return true; } }
+        5 => { if check_bounds(mx, my, cx, cy + 30, 200, 28) { ANIMATIONS = !ANIMATIONS; return true; } }
+        6 => {
+            if check_bounds(mx, my, cx, cy + 200, 200, 32) {
+                THEME_ID = 0; CURSOR_SPEED = 1; BRIGHTNESS = 1; ICON_SIZE = 1;
+                SHOW_CLOCK = true; ANIMATIONS = true; CACHE_VALID = false;
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+unsafe fn draw_settings_content(fb: *mut u32, x: isize, y: isize) {
+    let (_, _, accent, _, txt, _) = theme_colors();
+    let labels = ["Тема", "Курсор", "Яркость", "Иконки", "Часы", "Анимации", "Сброс"];
+    let mut ty = y + 40;
+    for (i, label) in labels.iter().enumerate() {
+        if (i as u8) == WM.settings_tab {
+            for dy in 0..28 { for dx in 0..130 { *fb.offset((ty + dy) * SCREEN_W + x + 10 + dx) = blend_color(accent, 0x00FFFFFF, 100); } }
+        }
+        draw_txt(fb, x + 16, ty + 10, label, txt);
+        ty += 30;
+    }
+    for dy in 35..360 { *fb.offset((y + dy) * SCREEN_W + x + 150) = 0x00C0C0C0; }
+    let cx = x + 160;
+    let cy = y + 40;
+    match WM.settings_tab {
+        0 => {
+            draw_txt(fb, cx, cy, "Тема:", txt);
+            let themes = ["Красная", "Синяя", "Зелёная", "Серая", "Фиолетовая"];
+            let mut by = cy + 30;
+            for (i, t) in themes.iter().enumerate() {
+                let is_sel = (i as u8) == THEME_ID;
+                if is_sel { for dy in 0..28 { for dx in 0..260 { *fb.offset((by + dy) * SCREEN_W + cx + dx) = accent; } } }
+                draw_txt(fb, cx + 10, by + 10, t, if is_sel { 0x00FFFFFF } else { txt });
+                by += 32;
+            }
+        }
+        1 => {
+            draw_txt(fb, cx, cy, "Скорость курсора:", txt);
+            let opts = ["Медленно", "Норма", "Быстро"];
+            let mut by = cy + 30;
+            for (i, o) in opts.iter().enumerate() {
+                let is_sel = (i as u8) == CURSOR_SPEED;
+                if is_sel { for dy in 0..28 { for dx in 0..200 { *fb.offset((by + dy) * SCREEN_W + cx + dx) = accent; } } }
+                draw_txt(fb, cx + 10, by + 10, o, if is_sel { 0x00FFFFFF } else { txt });
+                by += 32;
+            }
+        }
+        2 => {
+            draw_txt(fb, cx, cy, "Яркость:", txt);
+            let opts = ["Тускло", "Норма", "Ярко"];
+            let mut by = cy + 30;
+            for (i, o) in opts.iter().enumerate() {
+                let is_sel = (i as u8) == BRIGHTNESS;
+                if is_sel { for dy in 0..28 { for dx in 0..200 { *fb.offset((by + dy) * SCREEN_W + cx + dx) = accent; } } }
+                draw_txt(fb, cx + 10, by + 10, o, if is_sel { 0x00FFFFFF } else { txt });
+                by += 32;
+            }
+        }
+        3 => {
+            draw_txt(fb, cx, cy, "Размер иконок:", txt);
+            let opts = ["Маленькие", "Средние", "Большие"];
+            let mut by = cy + 30;
+            for (i, o) in opts.iter().enumerate() {
+                let is_sel = (i as u8) == ICON_SIZE;
+                if is_sel { for dy in 0..28 { for dx in 0..200 { *fb.offset((by + dy) * SCREEN_W + cx + dx) = accent; } } }
+                draw_txt(fb, cx + 10, by + 10, o, if is_sel { 0x00FFFFFF } else { txt });
+                by += 32;
+            }
+        }
+        4 => {
+            draw_txt(fb, cx, cy, "Показ часов:", txt);
+            if SHOW_CLOCK { for dy in 0..28 { for dx in 0..200 { *fb.offset((cy + 30 + dy) * SCREEN_W + cx + dx) = accent; } } }
+            draw_txt(fb, cx + 10, cy + 40, if SHOW_CLOCK { "Включено" } else { "Выключено" }, if SHOW_CLOCK { 0x00FFFFFF } else { txt });
+        }
+        5 => {
+            draw_txt(fb, cx, cy, "Анимации окон:", txt);
+            if ANIMATIONS { for dy in 0..28 { for dx in 0..200 { *fb.offset((cy + 30 + dy) * SCREEN_W + cx + dx) = accent; } } }
+            draw_txt(fb, cx + 10, cy + 40, if ANIMATIONS { "Включены" } else { "Выключены" }, if ANIMATIONS { 0x00FFFFFF } else { txt });
+        }
+        6 => {
+            draw_txt(fb, cx, cy, "Сброс настроек:", txt);
+            for dy in 0..32 { for dx in 0..200 { *fb.offset((cy + 200 + dy) * SCREEN_W + cx + dx) = blend_color(accent, 0x00000000, 80); } }
+            draw_txt(fb, cx + 10, cy + 211, "Сбросить все", 0x00FFFFFF);
+        }
+        _ => {}
+    }
+}
+// ==========================================
+// 18. ГЛАВНЫЙ ЦИКЛ
+// ==========================================
+pub unsafe fn run_graphics(_mode: u32, _addr: u32) -> ! {
+    let fb = (*ptr::addr_of_mut!(BACK_BUFFER)).data.as_mut_ptr();
+    init_wallpaper_embedded();
+    init_ps2_mouse();
+    let _ = net_init_c();
+    draw_background(fb);
+    fb_flush_all();
+    let mut prev_mouse_x = WM.mouse_x;
+    let mut prev_mouse_y = WM.mouse_y;
+    let mut force_full_redraw = true;
+    loop {
+        let mut polls = 8;
+        while polls > 0 {
+            let status = inb(0x64);
+            if (status & 0x01) == 0 { break; }
+            let data = inb(0x60);
+            if (status & 0x20) != 0 { poll_mouse_event_from_byte(data); }
+            else { handle_keyboard_input(data); }
+            polls -= 1;
+        }
+        if WM.vga_mode {
+            CURSOR_BLINK = CURSOR_BLINK.wrapping_add(1);
+            if CURSOR_BLINK % 60 < 30 { vga_set_cursor(VGA_CURSOR_Y); }
+            else { outb(0x3D4, 0x0F); outb(0x3D5, 0xFF); outb(0x3D4, 0x0E); outb(0x3D5, 0xFF); }
+            FRAME_COUNTER = FRAME_COUNTER.wrapping_add(1);
+            continue;
+        }
+        let anim_step: u8 = if ANIMATIONS { 5 } else { 100 };
+        let mut need_full_redraw = false;
+        if WM.is_calc_open && !WM.calc_minimized && WM.calc_anim < 100 { WM.calc_anim = WM.calc_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_calc_open || WM.calc_minimized { if WM.calc_anim > 0 { WM.calc_anim = WM.calc_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_explorer_open && !WM.explorer_minimized && WM.explorer_anim < 100 { WM.explorer_anim = WM.explorer_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_explorer_open || WM.explorer_minimized { if WM.explorer_anim > 0 { WM.explorer_anim = WM.explorer_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_settings_open && !WM.settings_minimized && WM.settings_anim < 100 { WM.settings_anim = WM.settings_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_settings_open || WM.settings_minimized { if WM.settings_anim > 0 { WM.settings_anim = WM.settings_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_console_open && !WM.console_minimized && WM.console_anim < 100 { WM.console_anim = WM.console_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_console_open || WM.console_minimized { if WM.console_anim > 0 { WM.console_anim = WM.console_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_notepad_open && !WM.notepad_minimized && WM.notepad_anim < 100 { WM.notepad_anim = WM.notepad_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_notepad_open || WM.notepad_minimized { if WM.notepad_anim > 0 { WM.notepad_anim = WM.notepad_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_taskman_open && !WM.taskman_minimized && WM.taskman_anim < 100 { WM.taskman_anim = WM.taskman_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_taskman_open || WM.taskman_minimized { if WM.taskman_anim > 0 { WM.taskman_anim = WM.taskman_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_browser_open && !WM.browser_minimized && WM.browser_anim < 100 { WM.browser_anim = WM.browser_anim.saturating_add(anim_step); need_full_redraw = true; }
+        if !WM.is_browser_open || WM.browser_minimized { if WM.browser_anim > 0 { WM.browser_anim = WM.browser_anim.saturating_sub(anim_step); need_full_redraw = true; } }
+        if WM.is_start_open && WM.start_anim < 100 { WM.start_anim = WM.start_anim.saturating_add(8); need_full_redraw = true; }
+        if !WM.is_start_open && WM.start_anim > 0 { WM.start_anim = WM.start_anim.saturating_sub(8); need_full_redraw = true; }
+        if WM.mouse_pressed && !WM.mouse_prev_pressed {
+            let mx = WM.mouse_x; let my = WM.mouse_y;
+            if try_close_buttons(mx, my) { need_full_redraw = true; }
+            else if check_bounds(mx, my, 5, SCREEN_H - 40, 40, 40) { WM.is_start_open = !WM.is_start_open; }
+            else if WM.is_start_open && WM.start_anim > 50 {
+                let mh: isize = 540;
+                let m_y: isize = SCREEN_H - 40 - (mh * WM.start_anim as isize / 100);
+                let m_x: isize = 5;
+                if check_bounds(mx, my, m_x + 4, m_y + mh - 38, 260, 30) { outb(0x64, 0xFE); }
+                else {
+                    let mut launched = false;
+                    let mut iy = m_y + 72;
+                    for i in 0..6 {
+                        if check_bounds(mx, my, m_x + 4, iy, 260, 32) {
+                            match i {
+                                0 => { WM.is_calc_open = true; WM.calc_minimized = false; WM.calc_anim = 0; }
+                                1 => { WM.is_explorer_open = true; WM.explorer_minimized = false; WM.explorer_anim = 0; }
+                                2 => { WM.is_settings_open = true; WM.settings_minimized = false; WM.settings_anim = 0; }
+                                3 => { WM.is_notepad_open = true; WM.notepad_minimized = false; WM.notepad_anim = 0; }
+                                4 => { WM.is_console_open = true; WM.console_minimized = false; WM.console_anim = 0; }
+                                5 => { WM.is_taskman_open = true; WM.taskman_minimized = false; WM.taskman_anim = 0; }
+                                _ => {}
+                            }
+                            WM.is_start_open = false; launched = true; break;
+                        }
+                        iy += 36;
+                    }
+                    if !launched && !check_bounds(mx, my, m_x, m_y, 420, mh) { WM.is_start_open = false; }
+                }
+            }
+            else if WM.is_settings_open && WM.settings_anim > 50 && check_bounds(mx, my, SETTINGS_X, SETTINGS_Y, 470, 370) {
+                handle_settings_click(mx, my, SETTINGS_X, SETTINGS_Y);
+            }
+            else {
+                let isz = icon_size();
+                let offs: [isize; 5] = [50, 50 + isz + 30, 50 + (isz + 30) * 2, 50 + (isz + 30) * 3, 50 + (isz + 30) * 4];
+                let mut clicked = false;
+                if check_bounds(mx, my, 50, offs, isz, isz) || check_bounds(mx, my, 50, offs + isz + 4, 120, 14) {
+                    WM.is_calc_open = true; WM.calc_minimized = false; WM.calc_anim = 0; clicked = true;
+                } else if check_bounds(mx, my, 50, offs, isz, isz) || check_bounds(mx, my, 50, offs + isz + 4, 120, 14) {
+                    WM.is_explorer_open = true; WM.explorer_minimized = false; WM.explorer_anim = 0; clicked = true;
+                } else if check_bounds(mx, my, 50, offs, isz, isz) || check_bounds(mx, my, 50, offs + isz + 4, 120, 14) {
+                    WM.is_settings_open = true; WM.settings_minimized = false; WM.settings_anim = 0; clicked = true;
+                } else if check_bounds(mx, my, 50, offs, isz, isz) || check_bounds(mx, my, 50, offs + isz + 4, 120, 14) {
+                    WM.is_notepad_open = true; WM.notepad_minimized = false; WM.notepad_anim = 0; clicked = true;
+                } else if check_bounds(mx, my, 50, offs, isz, isz) || check_bounds(mx, my, 50, offs + isz + 4, 120, 14) {
+                    WM.is_taskman_open = true; WM.taskman_minimized = false; WM.taskman_anim = 0; clicked = true;
+                } else if check_bounds(mx, my, 50, offs + isz + 34, isz, isz) {
+                    WM.is_browser_open = true; WM.browser_minimized = false; WM.browser_anim = 0; clicked = true;
+                }
+                if !clicked {
+                    if WM.is_calc_open && WM.calc_anim > 50 && check_bounds(mx, my, CALC_X, CALC_Y, 320, 26) {
+                        WM.dragging_window = WIN_CALC; WM.drag_offset_x = mx - CALC_X; WM.drag_offset_y = my - CALC_Y;
+                    } else if WM.is_explorer_open && WM.explorer_anim > 50 && check_bounds(mx, my, EXPLORER_X, EXPLORER_Y, 520, 26) {
+                        WM.dragging_window = WIN_EXPLORER; WM.drag_offset_x = mx - EXPLORER_X; WM.drag_offset_y = my - EXPLORER_Y;
+                    } else if WM.is_settings_open && WM.settings_anim > 50 && check_bounds(mx, my, SETTINGS_X, SETTINGS_Y, 470, 26) {
+                        WM.dragging_window = WIN_SETTINGS; WM.drag_offset_x = mx - SETTINGS_X; WM.drag_offset_y = my - SETTINGS_Y;
+                    } else if WM.is_notepad_open && WM.notepad_anim > 50 && check_bounds(mx, my, NOTEPAD_X, NOTEPAD_Y, 520, 26) {
+                        WM.dragging_window = WIN_NOTEPAD; WM.drag_offset_x = mx - NOTEPAD_X; WM.drag_offset_y = my - NOTEPAD_Y;
+                    } else if WM.is_console_open && WM.console_anim > 50 && check_bounds(mx, my, CONSOLE_X, CONSOLE_Y, 620, 26) {
+                        WM.dragging_window = WIN_CONSOLE; WM.drag_offset_x = mx - CONSOLE_X; WM.drag_offset_y = my - CONSOLE_Y;
+                    } else if WM.is_taskman_open && WM.taskman_anim > 50 && check_bounds(mx, my, TASKMAN_X, TASKMAN_Y, 400, 26) {
+                        WM.dragging_window = WIN_TASKMAN; WM.drag_offset_x = mx - TASKMAN_X; WM.drag_offset_y = my - TASKMAN_Y;
+                    } else if WM.is_browser_open && WM.browser_anim > 50 && check_bounds(mx, my, BROWSER_X, BROWSER_Y, 600, 26) {
+                        WM.dragging_window = WIN_BROWSER; WM.drag_offset_x = mx - BROWSER_X; WM.drag_offset_y = my - BROWSER_Y;
+                    }
+                }
+            }
+            need_full_redraw = true;
+        }
+        if !WM.mouse_pressed && WM.mouse_prev_pressed { WM.dragging_window = WIN_NONE; }
+        WM.mouse_prev_pressed = WM.mouse_pressed;
+        if WM.dragging_window != WIN_NONE && WM.mouse_pressed {
+            let nx = WM.mouse_x - WM.drag_offset_x;
+            let ny = WM.mouse_y - WM.drag_offset_y;
+            match WM.dragging_window {
+                WIN_CALC => { CALC_X = nx; CALC_Y = ny; }
+                WIN_EXPLORER => { EXPLORER_X = nx; EXPLORER_Y = ny; }
+                WIN_SETTINGS => { SETTINGS_X = nx; SETTINGS_Y = ny; }
+                WIN_NOTEPAD => { NOTEPAD_X = nx; NOTEPAD_Y = ny; }
+                WIN_CONSOLE => { CONSOLE_X = nx; CONSOLE_Y = ny; }
+                WIN_TASKMAN => { TASKMAN_X = nx; TASKMAN_Y = ny; }
+                WIN_BROWSER => { BROWSER_X = nx; BROWSER_Y = ny; }
+                _ => {}
+            }
+            need_full_redraw = true;
+        }
+        let cursor_moved = WM.mouse_x != prev_mouse_x || WM.mouse_y != prev_mouse_y;
+        if need_full_redraw || force_full_redraw {
+            cursor_restore_bg();
+            draw_background(fb);
+            let isz = icon_size();
+            let offs: [isize; 5] = [50, 50 + isz + 30, 50 + (isz + 30) * 2, 50 + (isz + 30) * 3, 50 + (isz + 30) * 4];
+            draw_calc_icon(fb, 50, offs); draw_icon_label_3d(fb, 50, offs + isz + 4, "Калькулятор", 0x00FFFFFF);
+            draw_folder_icon(fb, 50, offs); draw_icon_label_3d(fb, 50, offs + isz + 4, "Проводник", 0x00FFFFFF);
+            draw_settings_icon(fb, 50, offs); draw_icon_label_3d(fb, 50, offs + isz + 4, "Настройки", 0x00FFFFFF);
+            draw_notepad_icon(fb, 50, offs); draw_icon_label_3d(fb, 50, offs + isz + 4, "Блокнот", 0x00FFFFFF);
+            draw_taskman_icon(fb, 50, offs); draw_icon_label_3d(fb, 50, offs + isz + 4, "Диспетчер", 0x00FFFFFF);
+            draw_browser_icon(fb, 50, offs + isz + 34);
+            draw_icon_label_3d(fb, 50, offs + isz + 34 + isz + 4, "Браузер", 0x00FFFFFF);
+            if WM.calc_anim > 0 {
+                let w = 320 * WM.calc_anim as isize / 100; let h = 420 * WM.calc_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, CALC_X, CALC_Y, w, h, WM.calc_anim);
+                    draw_aero_titlebar(fb, CALC_X, CALC_Y, w, "Калькулятор", WM.calc_anim);
+                    if WM.calc_anim > 50 { draw_calc_content(fb, CALC_X, CALC_Y); }
+                }
+            }
+            if WM.explorer_anim > 0 {
+                let w = 520 * WM.explorer_anim as isize / 100; let h = 420 * WM.explorer_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, EXPLORER_X, EXPLORER_Y, w, h, WM.explorer_anim);
+                    draw_aero_titlebar(fb, EXPLORER_X, EXPLORER_Y, w, "Проводник", WM.explorer_anim);
+                    if WM.explorer_anim > 50 { draw_explorer_content(fb, EXPLORER_X, EXPLORER_Y); }
+                }
+            }
+            if WM.settings_anim > 0 {
+                let w = 470 * WM.settings_anim as isize / 100; let h = 370 * WM.settings_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, SETTINGS_X, SETTINGS_Y, w, h, WM.settings_anim);
+                    draw_aero_titlebar(fb, SETTINGS_X, SETTINGS_Y, w, "Настройки", WM.settings_anim);
+                    if WM.settings_anim > 50 { draw_settings_content(fb, SETTINGS_X, SETTINGS_Y); }
+                }
+            }
+            if WM.notepad_anim > 0 {
+                let w = 520 * WM.notepad_anim as isize / 100; let h = 420 * WM.notepad_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, NOTEPAD_X, NOTEPAD_Y, w, h, WM.notepad_anim);
+                    draw_aero_titlebar(fb, NOTEPAD_X, NOTEPAD_Y, w, "Блокнот", WM.notepad_anim);
+                    if WM.notepad_anim > 50 { draw_notepad_content(fb, NOTEPAD_X, NOTEPAD_Y); }
+                }
+            }
+            if WM.console_anim > 0 {
+                let w = 620 * WM.console_anim as isize / 100; let h = 420 * WM.console_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, CONSOLE_X, CONSOLE_Y, w, h, WM.console_anim);
+                    draw_aero_titlebar(fb, CONSOLE_X, CONSOLE_Y, w, "Терминал", WM.console_anim);
+                    if WM.console_anim > 50 { draw_console_content(fb, CONSOLE_X, CONSOLE_Y); }
+                }
+            }
+            if WM.taskman_anim > 0 {
+                let w = 400 * WM.taskman_anim as isize / 100; let h = 400 * WM.taskman_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, TASKMAN_X, TASKMAN_Y, w, h, WM.taskman_anim);
+                    draw_aero_titlebar(fb, TASKMAN_X, TASKMAN_Y, w, "Диспетчер", WM.taskman_anim);
+                    if WM.taskman_anim > 50 { draw_taskman_content(fb, TASKMAN_X, TASKMAN_Y); }
+                }
+            }
+            if WM.browser_anim > 0 {
+                let w = 600 * WM.browser_anim as isize / 100; let h = 500 * WM.browser_anim as isize / 100;
+                if w > 0 && h > 0 {
+                    draw_aero_window(fb, BROWSER_X, BROWSER_Y, w, h, WM.browser_anim);
+                    draw_aero_titlebar(fb, BROWSER_X, BROWSER_Y, w, "Браузер", WM.browser_anim);
+                    if WM.browser_anim > 50 { draw_browser_content(fb, BROWSER_X, BROWSER_Y); }
+                }
+            }
+            draw_taskbar(fb);
+            draw_start_menu(fb, WM.start_anim);
+            cursor_save_bg(WM.mouse_x, WM.mouse_y);
+            draw_cursor(fb, WM.mouse_x, WM.mouse_y);
+            fb_wait_vsync();
+            fb_flush_all();
+            force_full_redraw = false;
+        } else if cursor_moved {
+            cursor_restore_bg();
+            fb_flush_rect(prev_mouse_x, prev_mouse_y, CURSOR_W, CURSOR_H);
+            cursor_save_bg(WM.mouse_x, WM.mouse_y);
+            draw_cursor(fb, WM.mouse_x, WM.mouse_y);
+            fb_flush_rect(WM.mouse_x, WM.mouse_y, CURSOR_W, CURSOR_H);
+        }
+        prev_mouse_x = WM.mouse_x;
+        prev_mouse_y = WM.mouse_y;
+        FRAME_COUNTER = FRAME_COUNTER.wrapping_add(1);
+    }
+}
+// ==========================================
+// 19. IO
+// ==========================================
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags));
+    value
+}
+#[inline(always)]
+unsafe fn outb(port: u16, value: u8) {
+    asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+}
+// ==========================================
+// 21. FFI К C-ДРАЙВЕРУ E1000
+// ==========================================
+extern "C" {
+    fn e1000_init() -> c_int;
+    fn e1000_send(data: *const u8, len: u32) -> c_int;
+    fn e1000_recv(buf: *mut u8, max_len: u32) -> c_int;
+    fn e1000_get_mac(out: *mut u8);
+    fn e1000_link_up() -> c_int;
+}
+pub static mut NET_READY_C: bool = false;
+pub unsafe fn net_link_up() -> bool { e1000_link_up() != 0 }
+pub unsafe fn net_init_c() -> bool { let r = e1000_init(); NET_READY_C = r == 0; NET_READY_C }
+pub unsafe fn net_send_c(frame: &[u8]) -> bool { if !NET_READY_C { return false; } e1000_send(frame.as_ptr(), frame.len() as u32) == 0 }
+pub unsafe fn net_recv_c(buf: &mut [u8]) -> usize { if !NET_READY_C { return 0; } let r = e1000_recv(buf.as_mut_ptr(), buf.len() as u32); if r > 0 { r as usize } else { 0 } }
+// ==========================================
+// 22. ДИАГНОСТИКА 64-BIT (ВТОРОЙ ПУНКТ GRUB)
+// ==========================================
+unsafe fn draw_hex64(fb: *mut u32, x: isize, y: isize, val: u64, color: u32) {
+    let hex = b"0123456789ABCDEF";
+    let mut buf = [0u8; 16];
+    for i in 0..16 { buf[i] = hex[((val >> ((15 - i) * 4)) & 0xF) as usize]; }
+    if let Ok(s) = core::str::from_utf8(&buf) { draw_txt(fb, x, y, s, color); }
+}
+unsafe fn pci_read_u16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
+    let addr: u32 = ((bus as u32) << 16) | ((slot as u32) << 11) | ((func as u32) << 8) | ((offset as u32) & 0xFC) | 0x80000000;
+    asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nomem, nostack));
+    let tmp: u32;
+    asm!("in eax, dx", in("dx") 0xCFCu16, out("eax") tmp, options(nomem, nostack));
+    ((tmp >> ((offset & 2) * 8)) & 0xFFFF) as u16
+}
+pub unsafe fn run_diag_64() -> ! {
+    let fb = REAL_FB;
+    for y in 0..SCREEN_H {
+        for x in 0..SCREEN_W { *fb.offset(y * SCREEN_W + x) = 0x00103050; }
+    }
+    draw_txt(fb, 40, 40, "=== midenOS 64-bit HARDWARE DIAGNOSTICS (HP 250 G1) ===", 0x00FFFFFF);
+    draw_txt(fb, 40, 75, "Режим ядра: 64-bit Long Mode (Rust)", 0x0000FF00);
+    draw_txt(fb, 40, 105, "Реальный адрес видеопамяти (FB): 0x", 0x00FFFF00);
+    draw_hex64(fb, 365, 105, REAL_FB as u64, 0x00FFFFFF);
+    draw_txt(fb, 40, 140, "Найденные устройства на шине PCI:", 0x00FFFF00);
+    let mut py = 165;
+    for dev in 0..32u8 {
+        let vendor = pci_read_u16(0, dev, 0, 0x00);
+        if vendor != 0xFFFF && vendor != 0x0000 {
+            let dev_id = pci_read_u16(0, dev, 0, 0x02);
+            draw_txt(fb, 60, py, "Vendor: 0x", 0x00CCCCCC);
+            draw_hex64(fb, 155, py, vendor as u64, 0x0000FF00);
+            draw_txt(fb, 320, py, "Device ID: 0x", 0x00CCCCCC);
+            draw_hex64(fb, 440, py, dev_id as u64, 0x0000FF00);
+            py += 20;
+            if py > 580 { break; }
+        }
+    }
+    draw_txt(fb, 40, 640, "Нажми ENTER для запуска рабочего стола midenOS...", 0x00FFFFFF);
+    loop {
+        if (inb(0x64) & 0x01) != 0 && inb(0x60) == 0x1C {
+            run_graphics(64, REAL_FB as u32);
+        }
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn kernel_main(mode: u32, _fb_addr: u32, mb_info: usize) -> ! {
+    parse_multiboot2(mb_info);
+    if IS_DIAG_MODE { run_diag_64(); }
+    run_graphics(mode, REAL_FB as u32);
+}

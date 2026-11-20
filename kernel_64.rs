@@ -1,0 +1,2548 @@
+// kernel/src/kernels/kernel_64.rs — Полное графическое ядро midenOS (Кириллица, VFS, 3D-иконки, Анимации)
+#![allow(static_mut_refs)]
+
+use core::arch::asm;
+use core::ptr;
+
+pub type FbPtr = *mut u32;
+
+pub const SCREEN_W: isize = 1024;
+pub const SCREEN_H: isize = 768;
+
+pub static mut REAL_FB: FbPtr = 0xFD00_0000 as FbPtr;
+pub static mut FB_PITCH: u32 = 1024 * 4;
+
+pub struct WindowManagerState {
+    pub mouse_x: isize,
+    pub mouse_y: isize,
+    pub mouse_pressed: bool,
+    pub last_scancode: u8,
+}
+
+pub static mut WM: WindowManagerState = WindowManagerState {
+    mouse_x: 512,
+    mouse_y: 384,
+    mouse_pressed: false,
+    last_scancode: 0,
+};
+
+static mut BACK_BUFFER: [u32; (SCREEN_W * SCREEN_H) as usize] = [0; (SCREEN_W * SCREEN_H) as usize];
+static mut BG_BUFFER: [u32; (SCREEN_W * SCREEN_H) as usize] = [0; (SCREEN_W * SCREEN_H) as usize];
+
+static WALLPAPER_BMP: &[u8] = include_bytes!("wallpaper.bmp");
+static mut WALLPAPER_ADDR: usize = 0;
+static mut WALLPAPER_SIZE: usize = 0;
+
+// Состояние окон и плавная анимация (0..=100)
+static mut WIN_TERMINAL: bool = false;
+static mut WIN_EXPLORER: bool = false;
+static mut WIN_NOTEPAD: bool = false;
+static mut WIN_CALC: bool = false;
+static mut WIN_PAINT: bool = false;
+static mut WIN_BROWSER: bool = false;
+static mut BROWSER_X: isize = 140;
+static mut BROWSER_Y: isize = 54;
+
+static mut WIN_SETTINGS: bool = false;
+static mut WIN_TASKMAN: bool = false;
+static mut WIN_START_MENU: bool = false;
+
+static mut MIN_TERMINAL: bool = false;
+static mut MIN_EXPLORER: bool = false;
+static mut MIN_NOTEPAD: bool = false;
+static mut MIN_CALC: bool = false;
+static mut MIN_PAINT: bool = false;
+static mut MIN_SETTINGS: bool = false;
+static mut MIN_TASKMAN: bool = false;
+
+static mut MAX_TERMINAL: bool = false;
+static mut MAX_EXPLORER: bool = false;
+static mut MAX_NOTEPAD: bool = false;
+static mut MAX_CALC: bool = false;
+static mut MAX_PAINT: bool = false;
+static mut MAX_SETTINGS: bool = false;
+static mut MAX_TASKMAN: bool = false;
+
+static mut ANIM_TERMINAL: isize = 0;
+static mut ANIM_EXPLORER: isize = 0;
+static mut ANIM_NOTEPAD: isize = 0;
+static mut ANIM_CALC: isize = 0;
+static mut ANIM_PAINT: isize = 0;
+static mut ANIM_SETTINGS: isize = 0;
+static mut ANIM_TASKMAN: isize = 0;
+static mut ANIM_START: isize = 0;
+static mut SMOOTH_ANIM: bool = true;
+
+// Координаты окон
+static mut TERMINAL_X: isize = 140;
+static mut TERMINAL_Y: isize = 85;
+static mut EXPLORER_X: isize = 190;
+static mut EXPLORER_Y: isize = 115;
+static mut NOTEPAD_X: isize = 240;
+static mut NOTEPAD_Y: isize = 135;
+static mut CALC_X: isize = 360;
+static mut CALC_Y: isize = 145;
+static mut PAINT_X: isize = 210;
+static mut PAINT_Y: isize = 105;
+static mut SETTINGS_X: isize = 230;
+static mut SETTINGS_Y: isize = 110;
+static mut TASKMAN_X: isize = 310;
+static mut TASKMAN_Y: isize = 155;
+
+// Параметры настроек (10 вкладок)
+static mut SETTINGS_TAB: usize = 0;
+static mut THEME_ID: usize = 0;
+static mut CURSOR_SPEED: isize = 2;
+static mut SHOW_CLOCK: bool = true;
+static mut GLASS_ALPHA: u32 = 235;
+static mut SHOW_SHADOWS: bool = true;
+static mut SOUND_ENABLED: bool = true;
+static mut NET_ENABLED: bool = true;
+static mut NET_ONLINE: bool = false;
+static mut NET_POPUP: bool = false;
+static mut KEYBOARD_RU: bool = false;
+
+// Контекстное меню создания
+static mut CTX_OPEN: bool = false;
+static mut CTX_TARGET_VFS: usize = usize::MAX;
+static mut RENAME_OPEN: bool = false;
+static mut RENAME_VFS_IDX: usize = usize::MAX;
+static mut RENAME_BUF: [u8; 32] = [0; 32];
+static mut RENAME_LEN: usize = 0;
+static mut CTX_X: isize = 0;
+static mut CTX_Y: isize = 0;
+
+// Виртуальная файловая система (VFS) в памяти
+#[derive(Copy, Clone, PartialEq)]
+pub enum VfsKind {
+    Empty,
+    Folder,
+    Txt,
+    Bmp,
+    Mrt,
+    Asm,
+    Cpp,
+    Cs,
+    Sys,
+}
+
+#[derive(Copy, Clone)]
+pub struct VfsNode {
+    pub kind: VfsKind,
+    pub parent: usize,
+    pub name: [u8; 32],
+    pub name_len: usize,
+    pub content: [u8; 256],
+    pub content_len: usize,
+}
+
+impl VfsNode {
+    const fn empty() -> Self {
+        Self {
+            kind: VfsKind::Empty,
+            parent: 0,
+            name: [0; 32],
+            name_len: 0,
+            content: [0; 256],
+            content_len: 0,
+        }
+    }
+    fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("unnamed")
+    }
+}
+
+const MAX_VFS: usize = 48;
+static mut VFS: [VfsNode; MAX_VFS] = [VfsNode::empty(); MAX_VFS];
+static mut VFS_INIT: bool = false;
+static mut CUR_DIR: usize = 0;
+static mut DESKTOP_SEL: isize = -1;
+static mut DESKTOP_CLICK_TIMER: u32 = 0;
+static mut EXPLORER_SEL: usize = usize::MAX;
+static mut OPEN_FILE_IDX: usize = usize::MAX;
+static mut FILE_COUNTER: u8 = 1;
+
+// Буферы терминала и блокнота
+pub static mut CONSOLE_TEXT: [u8; 1024] = [0; 1024];
+pub static mut CONSOLE_TEXT_LEN: usize = 0;
+static mut CONSOLE_OUT: [[u8; 64]; 10] = [[0; 64]; 10];
+static mut CONSOLE_OUT_LEN: [usize; 10] = [0; 10];
+static mut CONSOLE_OUT_CNT: usize = 0;
+
+pub static mut NOTEPAD_TEXT: [u8; 2048] = [0; 2048];
+pub static mut NOTEPAD_TEXT_LEN: usize = 0;
+
+// Состояние PS/2 мыши
+static mut MOUSE_X: isize = SCREEN_W / 2;
+static mut MOUSE_Y: isize = SCREEN_H / 2;
+static mut MOUSE_LEFT: bool = false;
+static mut MOUSE_RIGHT: bool = false;
+static mut MOUSE_CYCLE: u8 = 0;
+static mut MOUSE_BYTE0: u8 = 0;
+static mut MOUSE_BYTE1: u8 = 0;
+
+static mut DRAG_WIN: u8 = 0;
+static mut DRAG_OFF_X: isize = 0;
+static mut DRAG_OFF_Y: isize = 0;
+static mut FOCUSED_WIN: u8 = 1;
+
+#[inline(always)]
+pub unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
+    val
+}
+
+#[inline(always)]
+pub unsafe fn outb(port: u16, val: u8) {
+    asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+}
+
+#[inline(always)]
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+#[inline(always)]
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+#[inline(always)]
+fn read_i32_le(buf: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+#[inline(always)]
+unsafe fn put_pixel(fb: FbPtr, x: isize, y: isize, color: u32) {
+    if x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H {
+        *fb.offset(y * SCREEN_W + x) = color;
+    }
+}
+
+fn detect_kind_by_name(name: &str) -> VfsKind {
+    if name.ends_with(".txt") || name.ends_with(".md") {
+        VfsKind::Txt
+    } else if name.ends_with(".bmp") || name.ends_with(".png") {
+        VfsKind::Bmp
+    } else if name.ends_with(".mrt") {
+        VfsKind::Mrt
+    } else if name.ends_with(".asm") || name.ends_with(".s") {
+        VfsKind::Asm
+    } else if name.ends_with(".cpp") || name.ends_with(".hpp") || name.ends_with(".c") {
+        VfsKind::Cpp
+    } else if name.ends_with(".cs") {
+        VfsKind::Cs
+    } else if name.ends_with(".sys") || name.ends_with(".bin") {
+        VfsKind::Sys
+    } else {
+        VfsKind::Txt
+    }
+}
+
+unsafe fn vfs_create(parent: usize, name: &str, kind: VfsKind, content: &str) -> Option<usize> {
+    for i in 1..MAX_VFS {
+        if VFS[i].kind == VfsKind::Empty {
+            let mut node = VfsNode::empty();
+            node.kind = kind;
+            node.parent = parent;
+            let nb = name.as_bytes();
+            let nlen = nb.len().min(31);
+            node.name[..nlen].copy_from_slice(&nb[..nlen]);
+            node.name_len = nlen;
+
+            let cb = content.as_bytes();
+            let clen = cb.len().min(255);
+            node.content[..clen].copy_from_slice(&cb[..clen]);
+            node.content_len = clen;
+
+            VFS[i] = node;
+            return Some(i);
+        }
+    }
+    None
+}
+
+
+pub unsafe fn save_snip_to_vfs(pixels: *const u32, w: isize, h: isize) {
+    let mut slot = 0usize;
+    for i in 1..MAX_VFS {
+        if VFS[i].kind == VfsKind::Txt && VFS[i].name_str() == "screen.bmp" {
+            slot = i;
+            break;
+        }
+        if slot == 0 && VFS[i].kind == VfsKind::Empty {
+            slot = i;
+        }
+    }
+    if slot == 0 { return; }
+    VFS[slot].kind = VfsKind::Txt;
+    VFS[slot].parent = 0;
+    let name = b"screen.bmp";
+    VFS[slot].name[..name.len()].copy_from_slice(name);
+    VFS[slot].name_len = name.len();
+
+    let cap = VFS[slot].content.len();
+    if cap < 64 { return; }
+    // Формируем компактный 24-битный BMP (90x45) в пределах буфера VFS
+    let bw = 60usize;
+    let bh = 30usize;
+    let data_sz = bw * bh * 3;
+    let total_sz = (54 + data_sz).min(cap);
+    let d = VFS[slot].content.as_mut_ptr();
+    *d.add(0) = b'B'; *d.add(1) = b'M';
+    *d.add(2) = (total_sz & 0xFF) as u8; *d.add(3) = ((total_sz >> 8) & 0xFF) as u8;
+    *d.add(10) = 54;
+    *d.add(14) = 40;
+    *d.add(18) = bw as u8;
+    *d.add(22) = bh as u8;
+    *d.add(26) = 1;
+    *d.add(28) = 24;
+
+    let mut off = 54usize;
+    let mut y = 0usize;
+    while y < bh && off + 3 <= cap {
+        let sy = ((bh - 1 - y) as isize * h) / (bh as isize);
+        let mut x = 0usize;
+        while x < bw && off + 3 <= cap {
+            let sx = (x as isize * w) / (bw as isize);
+            let px = core::ptr::read_volatile(pixels.offset(sy * w + sx));
+            *d.add(off) = (px & 0xFF) as u8;
+            *d.add(off + 1) = ((px >> 8) & 0xFF) as u8;
+            *d.add(off + 2) = ((px >> 16) & 0xFF) as u8;
+            off += 3;
+            x += 1;
+        }
+        y += 1;
+    }
+    VFS[slot].content_len = off;
+}
+
+unsafe fn init_vfs() {
+    if VFS_INIT {
+        return;
+    }
+    VFS_INIT = true;
+    VFS[0].kind = VfsKind::Folder;
+    let root_name = b"C:/midenOS";
+    VFS[0].name[..root_name.len()].copy_from_slice(root_name);
+    VFS[0].name_len = root_name.len();
+
+    let sys_dir = vfs_create(0, "System", VfsKind::Folder, "").unwrap_or(0);
+    let dev_dir = vfs_create(0, "Projects", VfsKind::Folder, "").unwrap_or(0);
+    vfs_create(sys_dir, "readme.txt", VfsKind::Txt, "Welcome to midenOS 64-bit!\nCreate files via click or terminal.");
+    vfs_create(sys_dir, "boot.mrt", VfsKind::Mrt, "MRT_EXEC_HEADER_V1: Ring0 Native Module");
+    vfs_create(sys_dir, "wall.bmp", VfsKind::Bmp, "BMP_IMAGE_DATA_1024x768");
+
+    vfs_create(sys_dir, "kernel.sys", VfsKind::Sys, "midenOS 64-bit Native Rust Kernel");
+    vfs_create(dev_dir, "bootloader.asm", VfsKind::Asm, "[BITS 64]\nmov rax, 0x1\nhlt");
+    vfs_create(dev_dir, "engine.cpp", VfsKind::Cpp, "#include <miden.hpp>\nint main() { return 0; }");
+    vfs_create(dev_dir, "Program.cs", VfsKind::Cs, "namespace midenOS { class App {} }");
+}
+
+pub unsafe fn init_wallpaper_embedded() {
+    WALLPAPER_ADDR = WALLPAPER_BMP.as_ptr() as usize;
+    WALLPAPER_SIZE = WALLPAPER_BMP.len();
+}
+
+pub unsafe fn parse_multiboot2(mb_info_addr: usize) {
+    if mb_info_addr == 0 {
+        return;
+    }
+    let total_size = ptr::read_volatile(mb_info_addr as *const u32) as usize;
+    if total_size < 16 || total_size > 0x10_0000 {
+        return;
+    }
+    let mut offset = 8usize;
+    while offset + 8 <= total_size {
+        let tag_type = ptr::read_volatile((mb_info_addr + offset) as *const u32);
+        let tag_size = ptr::read_volatile((mb_info_addr + offset + 4) as *const u32) as usize;
+        if tag_type == 0 || tag_size < 8 {
+            break;
+        }
+        if tag_type == 8 && tag_size >= 32 {
+            let fb_lo = ptr::read_volatile((mb_info_addr + offset + 8) as *const u32) as u64;
+            let fb_hi = ptr::read_volatile((mb_info_addr + offset + 12) as *const u32) as u64;
+            let pitch = ptr::read_volatile((mb_info_addr + offset + 16) as *const u32);
+            let fb_addr = (fb_hi << 32) | fb_lo;
+            if fb_addr != 0 {
+                REAL_FB = fb_addr as FbPtr;
+            }
+            if pitch != 0 {
+                FB_PITCH = pitch;
+            }
+        }
+        offset += (tag_size + 7) & !7;
+    }
+}
+
+pub unsafe fn try_draw_wallpaper_bmp(dst: FbPtr) -> bool {
+    if WALLPAPER_ADDR == 0 || WALLPAPER_SIZE < 54 {
+        return false;
+    }
+    let data = core::slice::from_raw_parts(WALLPAPER_ADDR as *const u8, WALLPAPER_SIZE);
+    if !data.starts_with(b"BM") {
+        return false;
+    }
+    let pixel_offset = read_u32_le(data, 10) as usize;
+    let bmp_w = read_i32_le(data, 18) as isize;
+    let bmp_h_raw = read_i32_le(data, 22);
+    let bpp = read_u16_le(data, 28) as usize;
+    let bytes_px = bpp / 8;
+    if bmp_w <= 0 || bmp_h_raw == 0 || (bytes_px != 3 && bytes_px != 4) {
+        return false;
+    }
+    let top_down = bmp_h_raw < 0;
+    let bmp_h = bmp_h_raw.unsigned_abs() as isize;
+    let stride = (bmp_w as usize * bytes_px + 3) & !3;
+    if pixel_offset + stride * (bmp_h as usize) > data.len() {
+        return false;
+    }
+    for y in 0..SCREEN_H {
+        let sy = (y * bmp_h) / SCREEN_H;
+        let src_row = if top_down { sy as usize } else { (bmp_h - 1 - sy) as usize };
+        let row_ptr = pixel_offset + src_row * stride;
+        let out_row = dst.offset(y * SCREEN_W);
+        for x in 0..SCREEN_W {
+            let sx = (x * bmp_w) / SCREEN_W;
+            let idx = row_ptr + (sx as usize) * bytes_px;
+            let b = data[idx] as u32;
+            let g = data[idx + 1] as u32;
+            let r = data[idx + 2] as u32;
+            *out_row.offset(x) = b | (g << 8) | (r << 16);
+        }
+    }
+    true
+}
+pub unsafe fn init_ps2_mouse() {
+    let wait_write = || {
+        for _ in 0..100_000 {
+            if (inb(0x64) & 0x02) == 0 {
+                break;
+            }
+        }
+    };
+    let wait_read = || {
+        for _ in 0..100_000 {
+            if (inb(0x64) & 0x01) != 0 {
+                break;
+            }
+        }
+    };
+    wait_write();
+    outb(0x64, 0xA8);
+    wait_write();
+    outb(0x64, 0x20);
+    wait_read();
+    let status = (inb(0x60) | 0x02) & !0x20;
+    wait_write();
+    outb(0x64, 0x60);
+    wait_write();
+    outb(0x60, status);
+    wait_write();
+    outb(0x64, 0xD4);
+    wait_write();
+    outb(0x60, 0xF6);
+    wait_read();
+    let _ = inb(0x60);
+    wait_write();
+    outb(0x64, 0xD4);
+    wait_write();
+    outb(0x60, 0xF4);
+    wait_read();
+    let _ = inb(0x60);
+}
+#[inline(always)]
+fn blend_color(bg: u32, fg: u32, alpha: u32) -> u32 {
+    let inv = 255 - alpha;
+    let r = (((bg >> 16) & 0xFF) * inv + ((fg >> 16) & 0xFF) * alpha) / 255;
+    let g = (((bg >> 8) & 0xFF) * inv + ((fg >> 8) & 0xFF) * alpha) / 255;
+    let b = ((bg & 0xFF) * inv + (fg & 0xFF) * alpha) / 255;
+    (r << 16) | (g << 8) | b
+}
+unsafe fn draw_glass_rect(fb: FbPtr, x: isize, y: isize, w: isize, h: isize, tint: u32, alpha: u32) {
+    let x0 = x.max(0);
+    let x1 = (x + w).min(SCREEN_W);
+    let y0 = y.max(0);
+    let y1 = (y + h).min(SCREEN_H);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for py in y0..y1 {
+        let dy = py - y;
+        let row = fb.offset(py * SCREEN_W);
+        let is_edge_y = dy < 3 || dy >= h - 3;
+        for px in x0..x1 {
+            if is_edge_y {
+                let dx = px - x;
+                if (dx < 3 && dy < 3 && dx + dy < 3)
+                    || (dx >= w - 3 && dy < 3 && (w - 1 - dx) + dy < 3)
+                    || (dx < 3 && dy >= h - 3 && dx + (h - 1 - dy) < 3)
+                    || (dx >= w - 3 && dy >= h - 3 && (w - 1 - dx) + (h - 1 - dy) < 3)
+                {
+                    continue;
+                }
+            }
+            let cur = *row.offset(px);
+            *row.offset(px) = blend_color(cur, tint, alpha);
+        }
+    }
+}
+
+unsafe fn draw_solid_rect(fb: FbPtr, x: isize, y: isize, w: isize, h: isize, color: u32) {
+    for dy in 0..h {
+        let py = y + dy;
+        if py < 0 || py >= SCREEN_H {
+            continue;
+        }
+        let row = fb.offset(py * SCREEN_W);
+        for dx in 0..w {
+            let px = x + dx;
+            if px >= 0 && px < SCREEN_W {
+                *row.offset(px) = color;
+            }
+        }
+    }
+}
+unsafe fn draw_vfs_file_icon(fb: FbPtr, x: isize, y: isize, kind: VfsKind) {
+    match kind {
+        VfsKind::Folder => {
+            draw_solid_rect(fb, x + 2, y + 3, 10, 4, 0x00F59E0B);
+            draw_solid_rect(fb, x + 2, y + 6, 22, 15, 0x00D97706);
+            draw_solid_rect(fb, x + 2, y + 8, 22, 12, 0x00FBBF24);
+        }
+        VfsKind::Mrt => {
+            draw_glass_rect(fb, x + 3, y + 2, 20, 22, 0x007C3AED, 250);
+            draw_solid_rect(fb, x + 5, y + 4, 16, 4, 0x00C4B5FD);
+            draw_txt(fb, x + 5, y + 11, "MRT", 0x00FFFFFF);
+        }
+        VfsKind::Asm => {
+            draw_glass_rect(fb, x + 3, y + 2, 20, 22, 0x00EA580C, 250);
+            draw_txt(fb, x + 5, y + 10, "ASM", 0x00FEF08A);
+        }
+        VfsKind::Cpp => {
+            draw_glass_rect(fb, x + 3, y + 2, 20, 22, 0x001D4ED8, 250);
+            draw_txt(fb, x + 5, y + 10, "C++", 0x00BAE6FD);
+        }
+        VfsKind::Cs => {
+            draw_glass_rect(fb, x + 3, y + 2, 20, 22, 0x0015803D, 250);
+            draw_txt(fb, x + 8, y + 10, "C#", 0x00BBF7D0);
+        }
+        VfsKind::Bmp => {
+            draw_glass_rect(fb, x + 3, y + 2, 20, 22, 0x00DB2777, 250);
+            draw_solid_rect(fb, x + 6, y + 6, 14, 10, 0x0038BDF8);
+            draw_solid_rect(fb, x + 6, y + 12, 14, 5, 0x004ADE80);
+        }
+        VfsKind::Sys => {
+            draw_glass_rect(fb, x + 3, y + 2, 20, 22, 0x00334155, 250);
+            draw_txt(fb, x + 5, y + 10, "SYS", 0x0094A3B8);
+        }
+        _ => {
+            draw_solid_rect(fb, x + 4, y + 2, 18, 22, 0x00F8FAFC);
+            draw_solid_rect(fb, x + 7, y + 6, 12, 2, 0x003B82F6);
+            draw_solid_rect(fb, x + 7, y + 11, 12, 2, 0x0064748B);
+            draw_solid_rect(fb, x + 7, y + 16, 8, 2, 0x0064748B);
+        }
+    }
+}
+unsafe fn draw_3d_app_icon(fb: FbPtr, x: isize, y: isize, size: isize, kind: usize) {
+    let (top_col, main_col, dark_col, hi_col) = match kind {
+        0 => (0x00334155, 0x001E293B, 0x00090D16, 0x0038BDF8),
+        1 => (0x00FB923C, 0x00EA580C, 0x007C2D12, 0x00FDE047),
+        2 => (0x0060A5FA, 0x002563EB, 0x001E3A8A, 0x0093C5FD),
+        3 => (0x004ADE80, 0x0016A34A, 0x0014532D, 0x00BBF7D0),
+        4 => (0x00C084FC, 0x009333EA, 0x004C1D95, 0x00F3E8FF),
+        5 => (0x0094A3B8, 0x00475569, 0x001E293B, 0x00E2E8F0),
+        _ => (0x0038BDF8, 0x000284C7, 0x000C4A6E, 0x00BAE6FD),
+    };
+    if SHOW_SHADOWS {
+        draw_glass_rect(fb, x + 3, y + 5, size, size, 0x00020617, 145);
+    }
+    draw_glass_rect(fb, x, y + 3, size, size, dark_col, 255);
+    draw_glass_rect(fb, x, y, size, size - 2, main_col, 250);
+    for dx in 3..(size - 3) {
+        put_pixel(fb, x + dx, y, top_col);
+        put_pixel(fb, x + dx, y + 1, blend_color(main_col, 0x00FFFFFF, 85));
+    }
+    if size >= 44 {
+        match kind {
+            0 => {
+                draw_solid_rect(fb, x + 8, y + 10, 36, 30, 0x00090D16);
+                draw_solid_rect(fb, x + 8, y + 10, 36, 5, 0x00334155);
+                draw_txt(fb, x + 13, y + 21, ">", hi_col);
+            }
+            1 => {
+                draw_glass_rect(fb, x + 9, y + 10, 34, 30, 0x00FFFBEB, 240);
+                draw_solid_rect(fb, x + 13, y + 14, 7, 7, 0x00EF4444);
+                draw_solid_rect(fb, x + 23, y + 13, 7, 7, 0x003B82F6);
+                draw_solid_rect(fb, x + 32, y + 16, 7, 7, 0x0022C55E);
+                draw_solid_rect(fb, x + 15, y + 25, 7, 7, 0x00EAB308);
+            }
+            2 => {
+                draw_solid_rect(fb, x + 10, y + 12, 14, 5, 0x00F59E0B);
+                draw_solid_rect(fb, x + 10, y + 16, 32, 22, 0x00D97706);
+                draw_solid_rect(fb, x + 12, y + 15, 28, 4, 0x00FFFFFF);
+                draw_solid_rect(fb, x + 10, y + 19, 32, 18, 0x00FBBF24);
+            }
+            3 => {
+                draw_solid_rect(fb, x + 11, y + 8, 28, 33, 0x00F8FAFC);
+                draw_solid_rect(fb, x + 15, y + 14, 20, 2, 0x003B82F6);
+                draw_solid_rect(fb, x + 15, y + 20, 18, 2, 0x0064748B);
+                draw_solid_rect(fb, x + 15, y + 26, 20, 2, 0x0064748B);
+            }
+            4 => {
+                draw_solid_rect(fb, x + 11, y + 9, 30, 34, 0x001E1B4B);
+                draw_solid_rect(fb, x + 14, y + 12, 24, 7, 0x0038BDF8);
+                for r in 0..3 {
+                    for c in 0..3 {
+                        let col = if c == 2 { 0x00F59E0B } else { 0x00E2E8F0 };
+                        draw_solid_rect(fb, x + 14 + c * 9, y + 22 + r * 6, 6, 4, col);
+                    }
+                }
+            }
+            _ => {
+                let cx = x + size / 2;
+                let cy = y + size / 2 - 1;
+                draw_solid_rect(fb, cx - 2, cy - 14, 5, 29, 0x00F8FAFC);
+                draw_solid_rect(fb, cx - 14, cy - 2, 29, 5, 0x00F8FAFC);
+                draw_solid_rect(fb, cx - 9, cy - 9, 19, 19, 0x00F8FAFC);
+                draw_solid_rect(fb, cx - 4, cy - 4, 9, 9, main_col);
+            }
+        }
+    } else {
+        match kind {
+            0 => draw_txt(fb, x + 4, y + 8, ">", hi_col),
+            1 => {
+                draw_solid_rect(fb, x + 5, y + 5, 5, 5, 0x00EF4444);
+                draw_solid_rect(fb, x + 12, y + 5, 5, 5, 0x0038BDF8);
+                draw_solid_rect(fb, x + 5, y + 12, 5, 5, 0x00FACC15);
+                draw_solid_rect(fb, x + 12, y + 12, 5, 5, 0x004ADE80);
+            }
+            2 => {
+                draw_solid_rect(fb, x + 4, y + 5, 7, 3, 0x00F59E0B);
+                draw_solid_rect(fb, x + 4, y + 8, 14, 9, 0x00FBBF24);
+            }
+            3 => {
+                draw_solid_rect(fb, x + 5, y + 4, 12, 14, 0x00F8FAFC);
+                draw_solid_rect(fb, x + 7, y + 7, 8, 2, 0x003B82F6);
+                draw_solid_rect(fb, x + 7, y + 11, 8, 2, 0x0064748B);
+            }
+            4 => {
+                draw_solid_rect(fb, x + 5, y + 4, 12, 4, 0x0038BDF8);
+                draw_solid_rect(fb, x + 5, y + 10, 5, 7, 0x00F8FAFC);
+                draw_solid_rect(fb, x + 12, y + 10, 5, 7, 0x00F59E0B);
+            }
+            5 => {
+                draw_solid_rect(fb, x + 9, y + 4, 4, 14, 0x00F8FAFC);
+                draw_solid_rect(fb, x + 4, y + 9, 14, 4, 0x00F8FAFC);
+                draw_solid_rect(fb, x + 7, y + 7, 8, 8, 0x00F8FAFC);
+                draw_solid_rect(fb, x + 9, y + 9, 4, 4, main_col);
+            }
+            _ => {
+                draw_solid_rect(fb, x + 4, y + 12, 3, 5, 0x0038BDF8);
+                draw_solid_rect(fb, x + 9, y + 8, 3, 9, 0x004ADE80);
+                draw_solid_rect(fb, x + 14, y + 5, 3, 12, 0x00FACC15);
+            }
+        }
+    }
+}
+pub unsafe fn draw_folder_icon(fb: FbPtr, x: isize, y: isize) {
+    draw_3d_app_icon(fb, x, y, 32, 2);
+}
+unsafe fn draw_animated_window(
+    fb: FbPtr,
+    wx: isize,
+    wy: isize,
+    ww: isize,
+    wh: isize,
+    title: &str,
+    focused: bool,
+    anim: isize,
+) -> (isize, isize, isize, isize, bool) {
+    let p = anim.clamp(0, 100);
+    let scale_w = (ww * (75 + p / 4)) / 100;
+    let scale_h = (wh * (75 + p / 4)) / 100;
+    let ax = wx + (ww - scale_w) / 2;
+    let ay = wy + (wh - scale_h) / 2 + ((100 - p) * 14) / 100;
+    let alpha = ((GLASS_ALPHA as isize) * p / 100) as u32;
+
+    if SHOW_SHADOWS {
+        draw_glass_rect(fb, ax + 6, ay + 8, scale_w, scale_h, 0x00020617, (130 * p / 100) as u32);
+    }
+    draw_glass_rect(fb, ax, ay, scale_w, scale_h, 0x000F172A, alpha);
+
+    let hdr_col = if focused { 0x001E293B } else { 0x00131C2E };
+    draw_glass_rect(fb, ax, ay, scale_w, 32, hdr_col, ((248 * p) / 100) as u32);
+
+    let accent = match THEME_ID {
+        1 => 0x0038BDF8,
+        2 => 0x0034D399,
+        _ => 0x0060A5FA,
+    };
+    let line_col = if focused { accent } else { 0x00334155 };
+    for dx in 4..(scale_w - 4) {
+        put_pixel(fb, ax + dx, ay, line_col);
+    }
+
+    if p >= 65 {
+        draw_txt(fb, ax + 14, ay + 11, title, 0x00F8FAFC);
+
+        let cy = ay + 16;
+        let min_x = ax + scale_w - 68;
+        draw_glass_rect(fb, min_x - 8, cy - 8, 17, 17, 0x00EAB308, 235);
+        draw_txt(fb, min_x - 3, cy - 5, "_", 0x00090D16);
+
+        let max_x = ax + scale_w - 46;
+        draw_glass_rect(fb, max_x - 8, cy - 8, 17, 17, 0x0022C55E, 235);
+        draw_txt(fb, max_x - 3, cy - 4, "+", 0x00090D16);
+
+        let close_x = ax + scale_w - 24;
+        draw_glass_rect(fb, close_x - 8, cy - 8, 17, 17, 0x00EF4444, 240);
+        draw_txt(fb, close_x - 3, cy - 4, "x", 0x00FFFFFF);
+    }
+
+    (ax, ay, scale_w, scale_h, p >= 80)
+}
+
+static FONT_8X8: [[u8; 8]; 96] = [
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
+[0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00],
+[0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00],
+[0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00],
+[0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00],
+[0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00],
+[0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00],
+[0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00],
+[0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00],
+[0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00],
+[0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00],
+[0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00],
+[0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06],
+[0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00],
+[0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00],
+[0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00],
+[0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00],
+[0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00],
+[0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00],
+[0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00],
+[0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00],
+[0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00],
+[0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00],
+[0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00],
+[0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00],
+[0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00],
+[0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00],
+[0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06],
+[0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00],
+[0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00],
+[0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00],
+[0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00],
+[0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00],
+[0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00],
+[0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00],
+[0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00],
+[0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00],
+[0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00],
+[0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00],
+[0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00],
+[0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00],
+[0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00],
+[0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00],
+[0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00],
+[0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00],
+[0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00],
+[0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00],
+[0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00],
+[0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00],
+[0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00],
+[0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00],
+[0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00],
+[0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00],
+[0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00],
+[0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00],
+[0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00],
+[0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00],
+[0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00],
+[0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00],
+[0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00],
+[0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00],
+[0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00],
+[0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00],
+[0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF],
+[0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00],
+[0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00],
+[0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00],
+[0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00],
+[0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00],
+[0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00],
+[0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00],
+[0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F],
+[0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00],
+[0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00],
+[0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E],
+[0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00],
+[0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00],
+[0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00],
+[0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00],
+[0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00],
+[0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F],
+[0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78],
+[0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00],
+[0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00],
+[0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00],
+[0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00],
+[0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00],
+[0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00],
+[0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00],
+[0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F],
+[0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00],
+[0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00],
+[0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00],
+[0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00],
+[0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00],
+[0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
+];
+// Кириллица 8x8: А-Я (0..31), а-я (32..63), Ё (64), ё (65)
+static CYRILLIC_8X8: [[u8; 8]; 66] = [
+    [0x1C,0x36,0x63,0x63,0x7F,0x63,0x63,0x00],
+[0x3F,0x66,0x06,0x3E,0x66,0x66,0x3F,0x00],
+[0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00],
+[0x7F,0x66,0x06,0x06,0x06,0x06,0x0F,0x00],
+[0x3C,0x6C,0x6C,0x6C,0x6C,0xFE,0xC6,0x00],
+[0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00],
+[0xDB,0xDB,0x7E,0x3C,0x7E,0xDB,0xDB,0x00],
+[0x3E,0x63,0x60,0x3C,0x60,0x63,0x3E,0x00],
+[0x63,0x73,0x7B,0x6F,0x67,0x63,0x63,0x00],
+[0x3C,0x00,0x63,0x73,0x7B,0x6F,0x63,0x00],
+[0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00],
+[0x78,0x6C,0x6C,0x6C,0x6C,0x6D,0x67,0x00],
+[0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0x00],
+[0x63,0x63,0x63,0x7F,0x63,0x63,0x63,0x00],
+[0x3E,0x63,0x63,0x63,0x63,0x63,0x3E,0x00],
+[0x7F,0x63,0x63,0x63,0x63,0x63,0x63,0x00],
+[0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00],
+[0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00],
+[0x7F,0x5A,0x18,0x18,0x18,0x18,0x3C,0x00],
+[0x63,0x63,0x63,0x7E,0x60,0x63,0x3E,0x00],
+[0x18,0x7E,0xDB,0xDB,0xDB,0x7E,0x18,0x00],
+[0x63,0x36,0x1C,0x1C,0x36,0x63,0x63,0x00],
+[0x66,0x66,0x66,0x66,0x66,0xFF,0xC0,0x00],
+[0x63,0x63,0x63,0x7E,0x60,0x60,0x60,0x00],
+[0xDB,0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0x00],
+[0xDB,0xDB,0xDB,0xDB,0xDB,0xFF,0xC0,0x00],
+[0x0F,0x0C,0x0C,0x3E,0x6C,0x6C,0x3E,0x00],
+[0x63,0x63,0x63,0x6F,0x7B,0x7B,0x6F,0x00],
+[0x07,0x06,0x06,0x3E,0x66,0x66,0x3E,0x00],
+[0x3E,0x63,0x60,0x7C,0x60,0x63,0x3E,0x00],
+[0x67,0x6D,0x6D,0x7F,0x6D,0x6D,0x67,0x00],
+[0x7E,0x63,0x63,0x7E,0x36,0x66,0x67,0x00],
+[0x00,0x00,0x3C,0x60,0x7C,0x66,0x7C,0x00],
+[0x3C,0x06,0x3E,0x66,0x66,0x66,0x3C,0x00],
+[0x00,0x00,0x3E,0x66,0x3E,0x66,0x3E,0x00],
+[0x00,0x00,0x7E,0x66,0x06,0x06,0x0F,0x00],
+[0x00,0x00,0x3C,0x6C,0x6C,0xFE,0xC6,0x00],
+[0x00,0x00,0x3C,0x66,0x7E,0x06,0x3C,0x00],
+[0x00,0x00,0xDB,0x7E,0x3C,0x7E,0xDB,0x00],
+[0x00,0x00,0x3C,0x66,0x38,0x66,0x3C,0x00],
+[0x00,0x00,0x66,0x76,0x7E,0x6E,0x66,0x00],
+[0x3C,0x00,0x66,0x76,0x7E,0x6E,0x66,0x00],
+[0x00,0x00,0x66,0x36,0x1E,0x36,0x66,0x00],
+[0x00,0x00,0x78,0x6C,0x6C,0x6D,0x67,0x00],
+[0x00,0x00,0x63,0x77,0x7F,0x6B,0x63,0x00],
+[0x00,0x00,0x66,0x66,0x7E,0x66,0x66,0x00],
+[0x00,0x00,0x3C,0x66,0x66,0x66,0x3C,0x00],
+[0x00,0x00,0x7E,0x66,0x66,0x66,0x66,0x00],
+[0x00,0x00,0x3E,0x66,0x66,0x3E,0x06,0x0F],
+[0x00,0x00,0x3C,0x66,0x06,0x66,0x3C,0x00],
+[0x00,0x00,0x7E,0x5A,0x18,0x18,0x3C,0x00],
+[0x00,0x00,0x66,0x66,0x7C,0x60,0x3C,0x00],
+[0x00,0x18,0x7E,0xDB,0xDB,0x7E,0x18,0x00],
+[0x00,0x00,0x66,0x3C,0x18,0x3C,0x66,0x00],
+[0x00,0x00,0x66,0x66,0x66,0xFF,0xC0,0x00],
+[0x00,0x00,0x66,0x66,0x7C,0x60,0x60,0x00],
+[0x00,0x00,0xDB,0xDB,0xDB,0xDB,0xFF,0x00],
+[0x00,0x00,0xDB,0xDB,0xDB,0xFF,0xC0,0x00],
+[0x00,0x00,0x0F,0x0C,0x3E,0x6C,0x3E,0x00],
+[0x00,0x00,0x63,0x63,0x6F,0x7B,0x6F,0x00],
+[0x00,0x00,0x06,0x06,0x3E,0x66,0x3E,0x00],
+[0x00,0x00,0x3C,0x66,0x78,0x66,0x3C,0x00],
+[0x00,0x00,0x67,0x6D,0x7F,0x6D,0x67,0x00],
+[0x00,0x00,0x7C,0x66,0x7C,0x36,0x66,0x00],
+[0x36,0x7F,0x06,0x3E,0x06,0x06,0x7F,0x00],
+[0x36,0x00,0x3C,0x66,
+0x7E,0x06,0x3C,0x00],
+];
+#[inline(always)]
+fn get_glyph(ch: char) -> Option<&'static [u8; 8]> {
+    let code = ch as u32;
+    if code >= 32 && code <= 126 {
+        FONT_8X8.get((code - 32) as usize)
+    } else if code >= 0x0410 && code <= 0x044F {
+        CYRILLIC_8X8.get((code - 0x0410) as usize)
+    } else if code == 0x0401 {
+        CYRILLIC_8X8.get(64)
+    } else if code == 0x0451 {
+        CYRILLIC_8X8.get(65)
+    } else if ch == '—' || ch == '–' {
+        FONT_8X8.get((b'-' - 32) as usize)
+    } else {
+        None
+    }
+}
+pub unsafe fn draw_txt(fb: FbPtr, mut x: isize, y: isize, text: &str, color: u32) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            continue;
+        }
+        if let Some(glyph) = get_glyph(ch) {
+            for (dy, &bits) in glyph.iter().enumerate() {
+                let py = y + dy as isize;
+                if py < 0 || py >= SCREEN_H {
+                    continue;
+                }
+                let row = fb.offset(py * SCREEN_W);
+                for dx in 0..8 {
+                    if (bits & (1 << dx)) != 0 {
+                        let px = x + dx;
+                        if px >= 0 && px < SCREEN_W {
+                            *row.offset(px) = color;
+                        }
+                    }
+                }
+            }
+        }
+        x += 8;
+    }
+}
+pub unsafe fn draw_cursor(fb: FbPtr, mx: isize, my: isize) {
+    let cursor_sprite: [&[u8]; 21] = [
+        b"B................",
+        b"BB...............",
+        b"BWB..............",
+        b"BWWB.............",
+        b"BWWWB............",
+        b"BWWWWB...........",
+        b"BWWWWWB..........",
+        b"BWWWWWWB.........",
+        b"BWWWWWWWB........",
+        b"BWWWWWWWWB.......",
+        b"BWWWWWWWWWB......",
+        b"BWWWWWWWWWWB.....",
+        b"BWWWWWWWWWWWB....",
+        b"BWWWWWWBBBBBB....",
+        b"BWWWBWWB.........",
+        b"BWWB.BWWB........",
+        b"BWB..BWWB........",
+        b"BB....BWWB.......",
+        b"B.....BWWB.......",
+        b".......BB........",
+        b".................",
+    ];
+    if SHOW_SHADOWS {
+        for (dy, row) in cursor_sprite.iter().enumerate() {
+            let py = my + dy as isize + 3;
+            if py < 0 || py >= SCREEN_H {
+                continue;
+            }
+            for (dx, &ch) in row.iter().enumerate() {
+                if ch != b'.' {
+                    let px = mx + dx as isize + 2;
+                    if px >= 0 && px < SCREEN_W {
+                        let dst = fb.offset(py * SCREEN_W + px);
+                        *dst = blend_color(*dst, 0x00020617, 110);
+                    }
+                }
+            }
+        }
+    }
+    for (dy, row) in cursor_sprite.iter().enumerate() {
+        let py = my + dy as isize;
+        if py < 0 || py >= SCREEN_H {
+            continue;
+        }
+        for (dx, &ch) in row.iter().enumerate() {
+            let px = mx + dx as isize;
+            if px < 0 || px >= SCREEN_W {
+                continue;
+            }
+            match ch {
+                b'B' => *fb.offset(py * SCREEN_W + px) = 0x00090D16,
+                b'W' => *fb.offset(py * SCREEN_W + px) = 0x00FFFFFF,
+                _ => {}
+            }
+        }
+    }
+}
+unsafe fn read_cmos_rtc() -> (u8, u8) {
+    let read_reg = |reg: u8| -> u8 {
+        outb(0x70, reg);
+        let v = inb(0x71);
+        (v & 0x0F) + ((v >> 4) * 10)
+    };
+    let h = read_reg(0x04);
+    let m = read_reg(0x02);
+    (h, m)
+}
+unsafe fn draw_desktop_icons(fb: FbPtr) {
+    let labels = [
+        "Терминал",
+        "Paint",
+        "Проводник",
+        "Блокнот",
+        "Калькулятор",
+        "Настройки",
+    ];
+    for (i, &label) in labels.iter().enumerate() {
+        let ix = 26;
+        let iy = 24 + (i as isize) * 94;
+        let hovered = MOUSE_X >= ix - 8 && MOUSE_X <= ix + 68 && MOUSE_Y >= iy - 6 && MOUSE_Y <= iy + 74;
+        if hovered {
+            draw_glass_rect(fb, ix - 8, iy - 6, 76, 80, 0x00FFFFFF, 42);
+        }
+        draw_3d_app_icon(fb, ix + 4, iy, 52, i);
+        let char_cnt = label.chars().count() as isize;
+        let tx = ix + 30 - char_cnt * 4;
+        draw_txt(fb, tx + 1, iy + 59, label, 0x00020617);
+        draw_txt(fb, tx, iy + 58, label, 0x00F8FAFC);
+    }
+    let mut col_idx = 0isize;
+    for idx in 1..MAX_VFS {
+        if VFS[idx].kind != VfsKind::Empty && VFS[idx].parent == 0 && col_idx < 6 {
+            let ix = 118;
+            let iy = 24 + col_idx * 94;
+            let hovered = MOUSE_X >= ix - 6 && MOUSE_X <= ix + 66 && MOUSE_Y >= iy - 6 && MOUSE_Y <= iy + 72;
+            if hovered {
+                draw_glass_rect(fb, ix - 6, iy - 6, 72, 78, 0x00FFFFFF, 38);
+            }
+            draw_glass_rect(fb, ix + 10, iy + 8, 40, 40, 0x001E293B, 210);
+            draw_vfs_file_icon(fb, ix + 17, iy + 15, VFS[idx].kind);
+            let name = VFS[idx].name_str();
+            let short_len = name.chars().count().min(10) as isize;
+            let tx = ix + 30 - short_len * 4;
+            draw_txt(fb, tx, iy + 56, name, 0x00E2E8F0);
+            col_idx += 1;
+
+            // --- Иконка и окно midenBrowser ---
+            draw_solid_rect(fb, 200, 24, 72, 76, 0x001E293B);
+            draw_solid_rect(fb, 216, 32, 40, 40, 0x000284C7);
+            draw_txt(fb, 224, 47, "WWW", 0x00FFFFFF);
+            draw_txt(fb, 212, 80, "Браузер", 0x00F8FAFC);
+            
+        }
+    }
+}
+unsafe fn draw_taskbar_and_start(fb: FbPtr) {
+    let bar_h: isize = 46;
+    let bar_y: isize = SCREEN_H - bar_h;
+    draw_glass_rect(fb, 0, bar_y, SCREEN_W, bar_h, 0x000B1120, 232);
+    draw_solid_rect(fb, 0, bar_y, SCREEN_W, 1, 0x00334155);
+    let start_x: isize = 10;
+    let start_y: isize = bar_y + 6;
+    let start_w: isize = 96;
+    let start_h: isize = 34;
+    let start_hover = MOUSE_X >= start_x && MOUSE_X <= start_x + start_w && MOUSE_Y >= start_y && MOUSE_Y <= start_y + start_h;
+    let start_bg = if WIN_START_MENU { 0x000284C7 } else if start_hover { 0x002563EB } else { 0x001E293B };
+    draw_glass_rect(fb, start_x, start_y, start_w, start_h, start_bg, 245);
+    draw_solid_rect(fb, start_x + 12, start_y + 10, 6, 6, 0x0038BDF8);
+    draw_solid_rect(fb, start_x + 20, start_y + 10, 6, 6, 0x0060A5FA);
+    draw_solid_rect(fb, start_x + 12, start_y + 18, 6, 6, 0x0034D399);
+    draw_solid_rect(fb, start_x + 20, start_y + 18, 6, 6, 0x00FBBF24);
+    draw_txt(fb, start_x + 34, start_y + 13, "Пуск", 0x00F8FAFC);
+    draw_solid_rect(fb, 116, bar_y + 10, 1, 26, 0x00334155);
+    let pinned: [(u8, usize, bool, bool); 2] = [
+        (2, 2, WIN_EXPLORER, MIN_EXPLORER),
+        (1, 0, WIN_TERMINAL, MIN_TERMINAL),
+    ];
+
+    for (i, &(win_id, icon_kind, open, minimized)) in pinned.iter().enumerate() {
+        let bx = 124 + (i as isize) * 42;
+        let by = bar_y + 6;
+        let bw = 36;
+        let bh = 34;
+        let is_focused = open && !minimized && FOCUSED_WIN == win_id;
+        let hovered = MOUSE_X >= bx && MOUSE_X <= bx + bw && MOUSE_Y >= by && MOUSE_Y <= by + bh;
+
+        let bg = if is_focused { 0x001E293B } else if open || hovered { 0x00131C2E } else { 0x000F172A };
+        draw_glass_rect(fb, bx, by, bw, bh, bg, 240);
+        draw_3d_app_icon(fb, bx + 7, by + 6, 22, icon_kind);
+
+        if open {
+            let ind_w = if is_focused { 22 } else { 10 };
+            let ind_col = if is_focused { 0x0038BDF8 } else { 0x0064748B };
+            draw_solid_rect(fb, bx + (bw - ind_w) / 2, by + bh - 3, ind_w, 2, ind_col);
+        }
+    }
+
+    draw_solid_rect(fb, 212, bar_y + 10, 1, 26, 0x00334155);
+
+    let dynamic_apps: [(&str, bool, bool, u8, usize); 5] = [
+        ("Paint",     WIN_PAINT,    MIN_PAINT,    5, 1),
+        ("Блокнот",   WIN_NOTEPAD,  MIN_NOTEPAD,  3, 3),
+        ("Кальк.",    WIN_CALC,     MIN_CALC,     4, 4),
+        ("Настройки", WIN_SETTINGS, MIN_SETTINGS, 6, 5),
+        ("Диспетчер", WIN_TASKMAN,  MIN_TASKMAN,  7, 6),
+    ];
+
+    let mut dyn_slot = 0isize;
+    for &(name, open, minimized, win_id, icon_kind) in dynamic_apps.iter() {
+        if !open {
+            continue;
+        }
+        let bx = 222 + dyn_slot * 114;
+        let by = bar_y + 6;
+        let bw = 108;
+        let bh = 34;
+        let is_focused = !minimized && FOCUSED_WIN == win_id;
+        let hovered = MOUSE_X >= bx && MOUSE_X <= bx + bw && MOUSE_Y >= by && MOUSE_Y <= by + bh;
+
+        draw_glass_rect(fb, bx, by, bw, bh, if is_focused { 0x001E293B } else if hovered { 0x00131C2E } else { 0x000F172A }, 240);
+        draw_3d_app_icon(fb, bx + 6, by + 6, 22, icon_kind);
+        draw_txt(fb, bx + 33, by + 13, name, 0x00F8FAFC);
+
+        let ind_w = if is_focused { 36 } else { 14 };
+        draw_solid_rect(fb, bx + (bw - ind_w) / 2, by + bh - 3, ind_w, 2, if is_focused { 0x0038BDF8 } else { 0x0064748B });
+        dyn_slot += 1;
+    }
+
+    let tray_x = SCREEN_W - 140;
+    draw_solid_rect(fb, tray_x, bar_y + 10, 1, 26, 0x00334155);
+    draw_txt(fb, tray_x + 12, bar_y + 19, if KEYBOARD_RU { "RU" } else { "EN" }, 0x0038BDF8);
+    let net_col = if NET_ONLINE { 0x004ADE80 } else { 0x0064748B };
+    draw_solid_rect(fb, tray_x + 38, bar_y + 24, 3, 5, net_col);
+    draw_solid_rect(fb, tray_x + 43, bar_y + 20, 3, 9, net_col);
+    draw_solid_rect(fb, tray_x + 48, bar_y + 16, 3, 13, net_col);
+    if !NET_ONLINE {
+        draw_solid_rect(fb, tray_x + 47, bar_y + 25, 5, 5, 0x00EF4444);
+    }
+    if NET_POPUP {
+        let px = SCREEN_W - 260;
+        let py = bar_y - 95;
+        draw_glass_rect(fb, px, py, 248, 86, 0x000F172A, 248);
+        draw_txt(fb, px + 12, py + 12, "Сеть midenOS:", 0x0038BDF8);
+        if NET_ONLINE {
+            draw_txt(fb, px + 12, py + 34, "Подключено • Интернет OK", 0x004ADE80);
+            draw_txt(fb, px + 12, py + 54, "Intel PRO/1000 Gigabit", 0x00CBD5E1);
+        } else if NET_ENABLED && NET_ENABLED {
+            draw_txt(fb, px + 12, py + 34, "Локальная сеть (DHCP/Ping...)", 0x00FACC15);
+            draw_txt(fb, px + 12, py + 54, "Intel PRO/1000 Gigabit", 0x00CBD5E1);
+        } else {
+            draw_txt(fb, px + 12, py + 34, "Нет подключения к сети", 0x00EF4444);
+            draw_txt(fb, px + 12, py + 54, "Intel PRO/1000 Gigabit", 0x0094A3B8);
+        }
+    }
+    if SHOW_CLOCK {
+        let (h, m) = read_cmos_rtc();
+        let tbuf: [u8; 5] = [
+            b'0' + (h / 10) % 10,
+            b'0' + (h % 10),
+            b':',
+            b'0' + (m / 10) % 10,
+            b'0' + (m % 10),
+        ];
+        if let Ok(tstr) = core::str::from_utf8(&tbuf) {
+            draw_txt(fb, SCREEN_W - 68, bar_y + 19, tstr, 0x00F8FAFC);
+        }
+    }
+    if ANIM_START > 0 {
+        let p = ANIM_START.clamp(0, 100);
+        let sx: isize = 10;
+        let sw: isize = 340;
+        let sh: isize = (522 * p) / 100;
+        let sy: isize = bar_y - sh - 8;
+        draw_glass_rect(fb, sx, sy, sw, sh, 0x000F172A, 245);
+        if p >= 75 {
+            draw_glass_rect(fb, sx + 12, sy + 12, sw - 24, 52, 0x001E293B, 235);
+            draw_3d_app_icon(fb, sx + 22, sy + 20, 34, 6);
+            let user = crate::kernels::login_screen::get_saved_username();
+            draw_txt(fb, sx + 66, sy + 22, user, 0x00F8FAFC);
+            draw_txt(fb, sx + 66, sy + 40, "midenOS 64-bit • Администратор", 0x0038BDF8);
+            let menu_items: [(&str, &str, usize); 10] = [
+                ("Терминал",        "Командная строка VFS",    0),
+                ("Paint Studio",    "Графический редактор",    1),
+                ("Проводник",       "Файлы и диски системы",   2),
+                ("Блокнот",         "Редактор кода и текста",  3),
+                ("Калькулятор",     "Вычисления",              4),
+                ("Настройки",       "10 вкладок системы",      5),
+                ("Сапёр",           "Классическая игра",       7),
+                ("Плеер",           "Синтезатор PC Speaker",   8),
+                ("Ножницы",         "Скриншоты области экрана",9),
+                ("Погода",          "Прогноз и метеосводка",   10),
+            ];
+            for (i, &(title, desc, kind)) in menu_items.iter().enumerate() {
+                let iy = sy + 76 + (i as isize) * 38;
+                let hovered = MOUSE_X >= sx + 12 && MOUSE_X <= sx + sw - 12 && MOUSE_Y >= iy && MOUSE_Y <= iy + 34;
+                if hovered {
+                    draw_glass_rect(fb, sx + 12, iy, sw - 24, 34, 0x000284C7, 210);
+                }
+                draw_3d_app_icon(fb, sx + 20, iy + 5, 24, kind);
+                draw_txt(fb, sx + 54, iy + 6, title, 0x00F8FAFC);
+                draw_txt(fb, sx + 54, iy + 20, desc, 0x0094A3B8);
+            }
+            let foot_y = sy + sh - 46;
+            draw_glass_rect(fb, sx + 14, foot_y, 100, 32, 0x001E293B, 220);
+            draw_txt(fb, sx + 48, foot_y + 10, "Сон", 0x0038BDF8);
+            draw_glass_rect(fb, sx + 120, foot_y, 100, 32, 0x001E293B, 220);
+            draw_txt(fb, sx + 148, foot_y + 10, "Ребут", 0x00FACC15);
+            draw_glass_rect(fb, sx + 226, foot_y, 100, 32, 0x007F1D1D, 220);
+            draw_txt(fb, sx + 258, foot_y + 10, "Выкл", 0x00FFFFFF);
+        }
+    }
+}
+unsafe fn draw_context_menu(fb: FbPtr) {
+    if CTX_OPEN {
+        if CTX_TARGET_VFS < MAX_VFS {
+            let mw: isize = 210;
+            let mh: isize = 116;
+            let mx = CTX_X.clamp(8, SCREEN_W - mw - 8);
+            let my = CTX_Y.clamp(8, SCREEN_H - mh - 54);
+
+            draw_glass_rect(fb, mx + 4, my + 4, mw, mh, 0x00020617, 160);
+            draw_glass_rect(fb, mx, my, mw, mh, 0x000F172A, 248);
+            draw_txt(fb, mx + 12, my + 8, VFS[CTX_TARGET_VFS].name_str(), 0x0038BDF8);
+
+            let file_items = ["Открыть файл", "Переименовать", "Удалить"];
+            for (i, &label) in file_items.iter().enumerate() {
+                let iy = my + 26 + (i as isize) * 28;
+                let hov = MOUSE_X >= mx + 6 && MOUSE_X <= mx + mw - 6 && MOUSE_Y >= iy && MOUSE_Y <= iy + 26;
+                if hov {
+                    let bg = if i == 2 { 0x00DC2626 } else { 0x000284C7 };
+                    draw_glass_rect(fb, mx + 6, iy, mw - 12, 26, bg, 225);
+                }
+                draw_txt(fb, mx + 14, iy + 9, label, 0x00F8FAFC);
+            }
+        } else {
+            let mw: isize = 236;
+            let mh: isize = 228;
+            let mx = CTX_X.clamp(8, SCREEN_W - mw - 8);
+            let my = CTX_Y.clamp(8, SCREEN_H - mh - 54);
+
+            draw_glass_rect(fb, mx + 4, my + 4, mw, mh, 0x00020617, 160);
+            draw_glass_rect(fb, mx, my, mw, mh, 0x000F172A, 248);
+            draw_txt(fb, mx + 12, my + 8, "Создать в midenOS:", 0x0038BDF8);
+
+            let items: [(&str, VfsKind); 7] = [
+                ("Новая папка",           VfsKind::Folder),
+                ("Текстовый файл (.txt)", VfsKind::Txt),
+                ("Картинка Paint (.bmp)", VfsKind::Bmp),
+                ("Модуль системы (.mrt)", VfsKind::Mrt),
+                ("Код Assembler (.asm)",  VfsKind::Asm),
+                ("Код C++ (.cpp)",        VfsKind::Cpp),
+                ("Код C# (.cs)",          VfsKind::Cs),
+            ];
+
+            for (i, &(label, kind)) in items.iter().enumerate() {
+                let iy = my + 26 + (i as isize) * 28;
+                let hov = MOUSE_X >= mx + 6 && MOUSE_X <= mx + mw - 6 && MOUSE_Y >= iy && MOUSE_Y <= iy + 26;
+                if hov {
+                    draw_glass_rect(fb, mx + 6, iy, mw - 12, 26, 0x000284C7, 220);
+                }
+                draw_vfs_file_icon(fb, mx + 10, iy + 1, kind);
+                draw_txt(fb, mx + 40, iy + 9, label, 0x00F8FAFC);
+            }
+        }
+    }
+
+    if RENAME_OPEN && RENAME_VFS_IDX < MAX_VFS {
+        let rw: isize = 340;
+        let rh: isize = 128;
+        let rx = (SCREEN_W - rw) / 2;
+        let ry = (SCREEN_H - rh) / 2;
+
+        draw_glass_rect(fb, rx + 6, ry + 8, rw, rh, 0x00020617, 170);
+        draw_glass_rect(fb, rx, ry, rw, rh, 0x000F172A, 250);
+        draw_txt(fb, rx + 14, ry + 12, "Переименовать объект (Enter — ОК):", 0x0038BDF8);
+
+        draw_glass_rect(fb, rx + 14, ry + 38, rw - 28, 30, 0x001E293B, 250);
+        if let Ok(name_str) = core::str::from_utf8(&RENAME_BUF[..RENAME_LEN]) {
+            draw_txt(fb, rx + 22, ry + 49, name_str, 0x00FFFFFF);
+        }
+        draw_txt(fb, rx + 22 + (RENAME_LEN as isize) * 8, ry + 49, "_", 0x0038BDF8);
+
+        draw_glass_rect(fb, rx + 14, ry + 82, 145, 30, 0x0016A34A, 240);
+        draw_txt(fb, rx + 46, ry + 93, "Сохранить", 0x00FFFFFF);
+
+        draw_glass_rect(fb, rx + 181, ry + 82, 145, 30, 0x00334155, 240);
+        draw_txt(fb, rx + 226, ry + 93, "Отмена", 0x00F8FAFC);
+    }
+}
+
+unsafe fn apply_rename() {
+    if RENAME_OPEN && RENAME_VFS_IDX < MAX_VFS && RENAME_LEN > 0 {
+        let len = RENAME_LEN.min(31);
+        VFS[RENAME_VFS_IDX].name = [0; 32];
+        VFS[RENAME_VFS_IDX].name[..len].copy_from_slice(&RENAME_BUF[..len]);
+        VFS[RENAME_VFS_IDX].name_len = len;
+        if VFS[RENAME_VFS_IDX].kind != VfsKind::Folder {
+            if let Ok(new_name) = core::str::from_utf8(&VFS[RENAME_VFS_IDX].name[..len]) {
+                VFS[RENAME_VFS_IDX].kind = detect_kind_by_name(new_name);
+            }
+        }
+    }
+    RENAME_OPEN = false;
+    RENAME_VFS_IDX = usize::MAX;
+}
+
+unsafe fn start_rename(idx: usize) {
+    if idx < MAX_VFS && VFS[idx].kind != VfsKind::Empty {
+        RENAME_VFS_IDX = idx;
+        let len = VFS[idx].name_len.min(31);
+        RENAME_BUF = [0; 32];
+        RENAME_BUF[..len].copy_from_slice(&VFS[idx].name[..len]);
+        RENAME_LEN = len;
+        RENAME_OPEN = true;
+    }
+}
+
+unsafe fn push_console_line(text: &str) {
+    let slot = if CONSOLE_OUT_CNT < 10 {
+        let s = CONSOLE_OUT_CNT;
+        CONSOLE_OUT_CNT += 1;
+        s
+    } else {
+        for i in 0..9 {
+            CONSOLE_OUT[i] = CONSOLE_OUT[i + 1];
+            CONSOLE_OUT_LEN[i] = CONSOLE_OUT_LEN[i + 1];
+        }
+        9
+    };
+    let bytes = text.as_bytes();
+    let len = bytes.len().min(63);
+    CONSOLE_OUT[slot] = [0; 64];
+    CONSOLE_OUT[slot][..len].copy_from_slice(&bytes[..len]);
+    CONSOLE_OUT_LEN[slot] = len;
+}
+unsafe fn execute_terminal_command(cmd: &str) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if trimmed == "wipe" {
+        CONSOLE_OUT_CNT = 0;
+        return;
+    }
+    if trimmed == "cd" {
+        crate::cd_popup::WIN_CD_POPUP = true;
+        let _ = crate::disk::poll_optical_drive();
+        push_console_line("[CD/DVD] Okno privoda otkryto");
+        return;
+    }
+    if trimmed == "eject" {
+        let _ = crate::disk::eject_optical_tray(true);
+        crate::cd_popup::WIN_CD_POPUP = true;
+        push_console_line("[CD/DVD] Lotok otkryt. Vstavte disk.");
+        return;
+    }
+    if trimmed == "rdm" {
+        crate::rdm::show_rdm("0x0000007B (CRITICAL_PROCESS_DIED)");
+    }
+    if trimmed == "shutdown" {
+        crate::power::smooth_shutdown();
+    }
+    if trimmed == "sleep" {
+        crate::power::enter_sleep_mode();
+        push_console_line("[Power] Выход из режима сна");
+        return;
+    }
+    if trimmed == "snip" {
+        crate::snip_app::start_snip_selection(RAM_BACKBUFFER.as_ptr(), SCREEN_W, SCREEN_H);
+        return;
+    }
+    if trimmed == "weather" {
+        crate::weather_app::WIN_WEATHER = true;
+        FOCUSED_WIN = 13;
+        push_console_line("[Погода] Метеосводка открыта");
+        return;
+    }
+    if trimmed == "sysinf" {
+        CONSOLE_OUT_CNT = 0;
+        let mut lines = [[0u8; 76]; 11];
+        crate::sysinf::build_sysinf_lines(&mut lines, 0 as u64);
+        let l_ptr = lines.as_ptr();
+        let mut i = 0usize;
+        while i < 11 {
+            let row_ptr = (*l_ptr.add(i)).as_ptr();
+            let mut len = 0usize;
+            while len < 76 && core::ptr::read_volatile(row_ptr.add(len)) != 0 {
+                len += 1;
+            }
+            let slice = core::slice::from_raw_parts(row_ptr, len);
+            if let Ok(s) = core::str::from_utf8(slice) {
+                push_console_line(s);
+            }
+            i += 1;
+        }
+        return;
+    }
+    if trimmed == "guide" {
+        push_console_line("scan | enter <dir> | back | fold <name>");
+        push_console_line("spawn <file> | launch <file> | read <file>");
+        push_console_line("erase <name> | core | user | sysinf | wipe | cycle");
+        return;
+    }
+    if trimmed == "scan" {
+        let mut found = false;
+        for i in 1..MAX_VFS {
+            if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR {
+                push_console_line(VFS[i].name_str());
+                found = true;
+            }
+        }
+        if !found {
+            push_console_line("[Sector empty]");
+        }
+        return;
+    }
+    if trimmed == "back" {
+        CUR_DIR = VFS[CUR_DIR].parent;
+        push_console_line(VFS[CUR_DIR].name_str());
+        return;
+    }
+    if let Some(dir_name) = trimmed.strip_prefix("enter ") {
+        let d = dir_name.trim();
+        for i in 1..MAX_VFS {
+            if VFS[i].kind == VfsKind::Folder && VFS[i].parent == CUR_DIR && VFS[i].name_str() == d {
+                CUR_DIR = i;
+                push_console_line(VFS[i].name_str());
+                return;
+            }
+        }
+        push_console_line("[Error] Folder not found");
+        return;
+    }
+    if let Some(dir_name) = trimmed.strip_prefix("fold ") {
+        let d = dir_name.trim();
+        if !d.is_empty() {
+            vfs_create(CUR_DIR, d, VfsKind::Folder, "");
+            push_console_line("[OK] Folder created in VFS");
+        }
+        return;
+    }
+    if let Some(file_name) = trimmed.strip_prefix("spawn ") {
+        let f = file_name.trim();
+        if !f.is_empty() {
+            let kind = detect_kind_by_name(f);
+            vfs_create(CUR_DIR, f, kind, "// midenOS Native File");
+            push_console_line("[OK] File spawned with type icon");
+        }
+        return;
+    }
+    if let Some(file_name) = trimmed.strip_prefix("launch ") {
+        let f = file_name.trim();
+        for i in 1..MAX_VFS {
+            if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR && VFS[i].name_str() == f {
+                open_vfs_node(i);
+                push_console_line("[OK] Launched in GUI window");
+                return;
+            }
+        }
+        push_console_line("[Error] Target not found");
+        return;
+    }
+    if let Some(file_name) = trimmed.strip_prefix("read ") {
+        let f = file_name.trim();
+        for i in 1..MAX_VFS {
+            if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR && VFS[i].name_str() == f {
+                let txt = core::str::from_utf8(&VFS[i].content[..VFS[i].content_len]).unwrap_or("");
+                push_console_line(txt);
+                return;
+            }
+        }
+        push_console_line("[Error] File not found");
+        return;
+    }
+    if let Some(file_name) = trimmed.strip_prefix("erase ") {
+        let f = file_name.trim();
+        for i in 1..MAX_VFS {
+            if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR && VFS[i].name_str() == f {
+                VFS[i].kind = VfsKind::Empty;
+                push_console_line("[OK] Erased from VFS");
+                return;
+            }
+        }
+        push_console_line("[Error] Object not found");
+        return;
+    }
+    match trimmed {
+        "core" => push_console_line("midenOS Ring-0 | x86_64 Rust | VFS + FluentUI"),
+        "user" => push_console_line(crate::kernels::login_screen::get_saved_username()),
+        "cycle" => outb(0x64, 0xFE),
+        _ => push_console_line("Unknown directive. Type: guide"),
+    }
+}
+
+unsafe fn draw_terminal_contents(fb: FbPtr, wx: isize, wy: isize) {
+    draw_txt(fb, wx + 14, wy + 40, "midenOS VFS Terminal (help, ls, mkdir, touch, cat, rm)", 0x0038BDF8);
+    for i in 0..CONSOLE_OUT_CNT {
+        if let Ok(line) = core::str::from_utf8(&CONSOLE_OUT[i][..CONSOLE_OUT_LEN[i]]) {
+            draw_txt(fb, wx + 14, wy + 62 + (i as isize) * 18, line, 0x00CBD5E1);
+        }
+    }
+    let prompt_y = wy + 62 + (CONSOLE_OUT_CNT as isize) * 18 + 6;
+    draw_txt(fb, wx + 14, prompt_y, "miden> ", 0x004ADE80);
+    if let Ok(cmd) = core::str::from_utf8(&CONSOLE_TEXT[..CONSOLE_TEXT_LEN]) {
+        draw_txt(fb, wx + 70, prompt_y, cmd, 0x00FFFFFF);
+    }
+    draw_txt(fb, wx + 70 + (CONSOLE_TEXT_LEN as isize) * 8, prompt_y, "_", 0x0038BDF8);
+}
+unsafe fn draw_explorer_contents(fb: FbPtr, wx: isize, wy: isize) {
+    let btns = ["< Назад", "+ Папка", "+ .mrt", "+ .cpp", "Открыть", "Удалить"];
+    for (i, &b) in btns.iter().enumerate() {
+        let bx = wx + 12 + (i as isize) * 73;
+        let by = wy + 38;
+        let hov = MOUSE_X >= bx && MOUSE_X <= bx + 69 && MOUSE_Y >= by && MOUSE_Y <= by + 24;
+        draw_glass_rect(fb, bx, by, 69, 24, if hov { 0x000284C7 } else { 0x001E293B }, 240);
+        draw_txt(fb, bx + 6, by + 8, b, 0x00F8FAFC);
+    }
+    draw_txt(fb, wx + 14, wy + 70, "Папка:", 0x0094A3B8);
+    draw_txt(fb, wx + 70, wy + 70, VFS[CUR_DIR].name_str(), 0x0038BDF8);
+    let mut row = 0isize;
+    for i in 1..MAX_VFS {
+        if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR && row < 6 {
+            let fy = wy + 92 + row * 30;
+            let selected = EXPLORER_SEL == i;
+            let hov = MOUSE_X >= wx + 12 && MOUSE_X <= wx + 448 && MOUSE_Y >= fy && MOUSE_Y <= fy + 28;
+            if selected {
+                draw_glass_rect(fb, wx + 12, fy, 436, 28, 0x002563EB, 210);
+            } else if hov {
+                draw_glass_rect(fb, wx + 12, fy, 436, 28, 0x001E293B, 190);
+            }
+            draw_vfs_file_icon(fb, wx + 18, fy + 2, VFS[i].kind);
+            draw_txt(fb, wx + 52, fy + 10, VFS[i].name_str(), 0x00F8FAFC);
+            let kind_tag = match VFS[i].kind {
+                VfsKind::Folder => "<ПАПКА>",
+                VfsKind::Mrt => "midenOS MRT",
+                VfsKind::Asm => "Assembler",
+                VfsKind::Cpp => "C++ Source",
+                VfsKind::Cs => "C# Source",
+                VfsKind::Bmp => "Paint BMP",
+                VfsKind::Sys => "System",
+                _ => "Text Doc",
+            };
+            draw_txt(fb, wx + 330, fy + 10, kind_tag, 0x0094A3B8);
+            row += 1;
+        }
+    }
+}
+unsafe fn draw_notepad_contents(fb: FbPtr, wx: isize, wy: isize) {
+    let title = if OPEN_FILE_IDX < MAX_VFS { VFS[OPEN_FILE_IDX].name_str() } else { "Новый документ" };
+    draw_txt(fb, wx + 14, wy + 40, "Файл:", 0x0094A3B8);
+    draw_txt(fb, wx + 62, wy + 40, title, 0x0038BDF8);
+    draw_glass_rect(fb, wx + 350, wy + 36, 96, 22, 0x0016A34A, 235);
+    draw_txt(fb, wx + 362, wy + 43, "Сохранить", 0x00FFFFFF);
+    let mut row: isize = 0;
+    let mut col: isize = 0;
+    for i in 0..NOTEPAD_TEXT_LEN {
+        let ch = NOTEPAD_TEXT[i];
+        if ch == b'\n' || col >= 52 {
+            row += 1;
+            col = 0;
+            if ch == b'\n' { continue; }
+        }
+        if row >= 15 { break; }
+        if let Ok(s) = core::str::from_utf8(&NOTEPAD_TEXT[i..=i]) {
+            draw_txt(fb, wx + 14 + col * 8, wy + 68 + row * 16, s, 0x00F8FAFC);
+        }
+        col += 1;
+    }
+    draw_txt(fb, wx + 14 + col * 8, wy + 68 + row * 16, "_", 0x0038BDF8);
+}
+unsafe fn draw_calc_contents(fb: FbPtr, wx: isize, wy: isize) {
+    draw_glass_rect(fb, wx + 14, wy + 42, 232, 36, 0x00020617, 230);
+    draw_txt(fb, wx + 24, wy + 54, "0", 0x0038BDF8);
+    let keys = ["7", "8", "9", "/", "4", "5", "6", "*", "1", "2", "3", "-", "C", "0", "=", "+"];
+    for i in 0..16 {
+        let kx = wx + 14 + ((i % 4) as isize) * 59;
+        let ky = wy + 88 + ((i / 4) as isize) * 44;
+        draw_glass_rect(fb, kx, ky, 53, 37, 0x001E293B, 235);
+        draw_txt(fb, kx + 22, ky + 15, keys[i], 0x00FFFFFF);
+    }
+}
+unsafe fn draw_settings_contents(fb: FbPtr, wx: isize, wy: isize) {
+    let tabs = [
+        "1. Темы",
+        "2. Анимации",
+        "3. Курсор",
+        "4. Экран",
+        "5. Стекло UI",
+        "6. Звук",
+        "7. Сеть",
+        "8. Язык/Ввод",
+        "9. Файлы VFS",
+        "10. О системе",
+    ];
+    draw_glass_rect(fb, wx + 10, wy + 38, 134, 292, 0x000B1120, 230);
+    for (i, &tab) in tabs.iter().enumerate() {
+        let ty = wy + 44 + (i as isize) * 28;
+        let active = SETTINGS_TAB == i;
+        if active {
+            draw_glass_rect(fb, wx + 14, ty, 126, 24, 0x000284C7, 240);
+        }
+        draw_txt(fb, wx + 20, ty + 8, tab, if active { 0x00FFFFFF } else { 0x0094A3B8 });
+    }
+    let px = wx + 156;
+    let py = wy + 46;
+    draw_txt(fb, px, py, tabs[SETTINGS_TAB], 0x0038BDF8);
+    draw_solid_rect(fb, px, py + 16, 340, 1, 0x00334155);
+    match SETTINGS_TAB {
+        0 => {
+            draw_txt(fb, px, py + 30, "Выберите акцентную тему (кликните):", 0x00CBD5E1);
+            draw_txt(fb, px, py + 58, "[] Полночный синий (Midnight)", if THEME_ID == 0 { 0x0060A5FA } else { 0x0094A3B8 });
+            draw_txt(fb, px, py + 84, "[] Северный лед (Nord Cyan)", if THEME_ID == 1 { 0x0038BDF8 } else { 0x0094A3B8 });
+            draw_txt(fb, px, py + 110, "[*] Изумрудная матрица (Emerald)", if THEME_ID == 2 { 0x0034D399 } else { 0x0094A3B8 });
+        }
+        1 => {
+            draw_txt(fb, px, py + 30, "Плавные анимации окон и меню:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, if SMOOTH_ANIM { "Статус: ВКЛЮЧЕНЫ (60 FPS)" } else { "Статус: ВЫКЛЮЧЕНЫ" }, 0x004ADE80);
+            draw_txt(fb, px, py + 90, "Кликните по области для переключения", 0x0094A3B8);
+        }
+        2 => {
+            draw_txt(fb, px, py + 30, "Скорость и тени 3D-курсора:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, if CURSOR_SPEED == 1 { "Скорость: Медленная (1x)" } else if CURSOR_SPEED == 2 { "Скорость: Средняя (2x)" } else { "Скорость: Быстрая (3x)" }, 0x0038BDF8);
+            draw_txt(fb, px, py + 90, "Кликните для изменения скорости", 0x0094A3B8);
+        }
+        3 => {
+            draw_txt(fb, px, py + 30, "Параметры видеоадаптера VBE:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, "Разрешение: 1024 x 768 (32-bit TrueColor)", 0x00F8FAFC);
+            draw_txt(fb, px, py + 88, "Двойная буферизация: Активна", 0x004ADE80);
+        }
+        4 => {
+            draw_txt(fb, px, py + 30, "Эффекты Fluent Glass и тени:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, if SHOW_SHADOWS { "Объемные тени: ВКЛ" } else { "Объемные тени: ВЫКЛ" }, 0x0038BDF8);
+            draw_txt(fb, px, py + 88, "Кликните для переключения теней", 0x0094A3B8);
+        }
+        5 => {
+            draw_txt(fb, px, py + 30, "Звуковая подсистема PC Speaker / HDA:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, if SOUND_ENABLED { "Системный звук: ВКЛЮЧЕН" } else { "Системный звук: БЕЗ ЗВУКА" }, 0x004ADE80);
+        }
+        6 => {
+            draw_txt(fb, px, py + 30, "Сетевой адаптер Intel e1000 Gigabit:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, if NET_ENABLED { "Состояние: Подключено (1000 Мбит/с)" } else { "Состояние: Отключено" }, 0x0038BDF8);
+        }
+        7 => {
+            draw_txt(fb, px, py + 30, "Раскладка клавиатуры PS/2:", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, if KEYBOARD_RU { "Активный язык: Русский (RU)" } else { "Активный язык: English (US)" }, 0x0038BDF8);
+        }
+        8 => {
+            draw_txt(fb, px, py + 30, "Виртуальная ФС (midenVFS):", 0x00CBD5E1);
+            draw_txt(fb, px, py + 60, "Поддержка форматов: .mrt .asm .cpp .cs .txt .bmp", 0x004ADE80);
+            draw_txt(fb, px, py + 88, "Кликните по пустому столу для создания файла", 0x0094A3B8);
+        }
+        _ => {
+            draw_txt(fb, px, py + 30, "midenOS Workstation 64-bit", 0x00F8FAFC);
+            draw_txt(fb, px, py + 58, "Ядро: Native Rust x86_64 Ring-0", 0x0038BDF8);
+            draw_txt(fb, px, py + 86, "Сборка: 2026 Fluent Edition", 0x0094A3B8);
+        }
+    }
+}
+unsafe fn draw_taskman_contents(fb: FbPtr, wx: isize, wy: isize) {
+    draw_txt(fb, wx + 16, wy + 44, "Активные службы ядра (Ring 0):", 0x0038BDF8);
+    draw_txt(fb, wx + 16, wy + 72, "kernel_64.sys      100%   Работает", 0x004ADE80);
+    draw_txt(fb, wx + 16, wy + 96, "miden_vfs.drv        2%   Работает", 0x00E2E8F0);
+    draw_txt(fb, wx + 16, wy + 120, "e1000_net.drv        1%   Активен", 0x00E2E8F0);
+    draw_txt(fb, wx + 16, wy + 144, "fluent_wm.exe        4%   60 FPS", 0x00E2E8F0);
+        crate::sysmon::draw_sysmon_widget(fb, SCREEN_W, wx, wy, MOUSE_X, MOUSE_Y);
+}
+fn scancode_to_ascii(sc: u8, shift: bool) -> u8 {
+    let normal: &[u8] = &[
+        0, 27, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 8, 9,
+        b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', 10, 0,
+        b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', 39, b'`', 0, 92,
+        b'z', b'x', b'c', b'v', b'b', b'n', b'm', b',', b'.', b'/', 0, 42, 0, b' ',
+    ];
+    let shifted: &[u8] = &[
+        0, 27, b'!', b'@', b'#', b'$', b'%', b'^', b'&', 42, b'(', b')', b'_', b'+', 8, 9,
+        b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', 10, 0,
+        b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', 34, b'~', 0, b'|',
+        b'Z', b'X', b'C', b'V', b'B', b'N', b'M', b'<', b'>', b'?', 0, 42, 0, b' ',
+    ];
+    let idx = sc as usize;
+    if idx < normal.len() {
+        let b = if shift { shifted[idx] } else { normal[idx] };
+        if b >= 32 && b <= 126 { return b; }
+    }
+    0
+}
+unsafe fn create_new_vfs_item(kind: VfsKind) {
+    let n = FILE_COUNTER;
+    FILE_COUNTER = FILE_COUNTER.wrapping_add(1).max(1);
+    let d1 = b'0' + (n / 10) % 10;
+    let d2 = b'0' + (n % 10);
+    let mut name_buf = [0u8; 24];
+    let (prefix, ext, template): (&[u8], &[u8], &str) = match kind {
+        VfsKind::Folder => (b"Folder_", b"", ""),
+        VfsKind::Bmp => (b"Image_", b".bmp", "BMP_CANVAS_256x256"),
+        VfsKind::Mrt => (b"Module_", b".mrt", "MRT_CUSTOM_BINARY_V1"),
+        VfsKind::Asm => (b"code_", b".asm", "section .text\nglobal start\n_start:\n    ret"),
+        VfsKind::Cpp => (b"main", b".cpp", "#include \nint main() { return 0; }"),
+        VfsKind::Cs => (b"App_", b".cs", "using System;\nclass Program { static void Main() {} }"),
+        _ => (b"Note_", b".txt", "Новый текстовый документ midenOS"),
+    };
+    let mut pos = 0;
+    name_buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    name_buf[pos] = d1;
+    name_buf[pos + 1] = d2;
+    pos += 2;
+    name_buf[pos..pos + ext.len()].copy_from_slice(ext);
+    pos += ext.len();
+    if let Ok(fname) = core::str::from_utf8(&name_buf[..pos]) {
+        vfs_create(CUR_DIR, fname, kind, template);
+    }
+}
+unsafe fn open_vfs_node(idx: usize) {
+    if idx >= MAX_VFS || VFS[idx].kind == VfsKind::Empty {
+        return;
+    }
+    match VFS[idx].kind {
+        VfsKind::Folder => {
+            CUR_DIR = idx;
+            EXPLORER_SEL = usize::MAX;
+        }
+        VfsKind::Bmp => {
+            WIN_PAINT = true;
+            FOCUSED_WIN = 5;
+        }
+        _ => {
+            OPEN_FILE_IDX = idx;
+            let len = VFS[idx].content_len.min(2000);
+            NOTEPAD_TEXT[..len].copy_from_slice(&VFS[idx].content[..len]);
+            NOTEPAD_TEXT_LEN = len;
+            WIN_NOTEPAD = true;
+            FOCUSED_WIN = 3;
+        }
+    }
+}
+unsafe fn handle_mouse_click(mx: isize, my: isize) {
+    if my < SCREEN_H - 46 && crate::snip_app::handle_snip_click(mx, my, RAM_BACKBUFFER.as_ptr(), SCREEN_W, SCREEN_H, &mut DRAG_WIN, &mut DRAG_OFF_X, &mut DRAG_OFF_Y, &mut FOCUSED_WIN) { CTX_OPEN = false; return; }
+    if my < SCREEN_H - 46 && crate::weather_app::handle_weather_click(mx, my, &mut DRAG_WIN, &mut DRAG_OFF_X, &mut DRAG_OFF_Y, &mut FOCUSED_WIN) { CTX_OPEN = false; return; }
+    if my < SCREEN_H - 46 && crate::cd_popup::handle_cd_popup_click(mx, my) { CTX_OPEN = false; return; }
+    if my < SCREEN_H - 46 && crate::sound::handle_player_click(mx, my, SOUND_ENABLED, &mut DRAG_WIN, &mut DRAG_OFF_X, &mut DRAG_OFF_Y, &mut FOCUSED_WIN) { CTX_OPEN = false; return; }
+    if my < SCREEN_H - 46 && crate::mines_app::handle_mines_click(mx, my, false, &mut DRAG_WIN, &mut DRAG_OFF_X, &mut DRAG_OFF_Y, &mut FOCUSED_WIN) {
+        CTX_OPEN = false;
+        return;
+    }
+    // Клик по иконке Браузера на рабочем столе (x: 200..272, y: 24..100)
+    if mx >= 200 && mx <= 272 && my >= 24 && my <= 100 && my < SCREEN_H - 46 {
+        WIN_BROWSER = true;
+        FOCUSED_WIN = 8;
+        CTX_OPEN = false;
+        return;
+    }
+    let bar_y: isize = SCREEN_H - 46;
+
+    if RENAME_OPEN {
+        let rw: isize = 340;
+        let rh: isize = 128;
+        let rx = (SCREEN_W - rw) / 2;
+        let ry = (SCREEN_H - rh) / 2;
+        if my >= ry + 82 && my <= ry + 112 {
+            if mx >= rx + 14 && mx <= rx + 159 {
+                apply_rename();
+            } else if mx >= rx + 181 && mx <= rx + 326 {
+                RENAME_OPEN = false;
+            }
+        }
+        return;
+    }
+
+    if CTX_OPEN {
+        if CTX_TARGET_VFS < MAX_VFS {
+            let mw: isize = 210;
+            let mh: isize = 116;
+            let cx = CTX_X.clamp(8, SCREEN_W - mw - 8);
+            let cy = CTX_Y.clamp(8, SCREEN_H - mh - 54);
+            if mx >= cx && mx <= cx + mw && my >= cy + 26 && my <= cy + 26 + 3 * 28 {
+                let idx = (my - (cy + 26)) / 28;
+                let target = CTX_TARGET_VFS;
+                CTX_OPEN = false;
+                CTX_TARGET_VFS = usize::MAX;
+                match idx {
+                    0 => {
+                        if VFS[target].kind == VfsKind::Folder {
+                            CUR_DIR = target;
+                            EXPLORER_SEL = usize::MAX;
+                            WIN_EXPLORER = true;
+                            MIN_EXPLORER = false;
+                            FOCUSED_WIN = 2;
+                        } else {
+                            open_vfs_node(target);
+                        }
+                    }
+                    1 => { start_rename(target); }
+                    2 => {
+                        VFS[target].kind = VfsKind::Empty;
+                        if EXPLORER_SEL == target { EXPLORER_SEL = usize::MAX; }
+                        DESKTOP_SEL = -1;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        } else {
+            let mw: isize = 236;
+            let mh: isize = 228;
+            let cx = CTX_X.clamp(8, SCREEN_W - mw - 8);
+            let cy = CTX_Y.clamp(8, SCREEN_H - mh - 54);
+            if mx >= cx && mx <= cx + mw && my >= cy + 26 && my <= cy + 26 + 7 * 28 {
+                let idx = (my - (cy + 26)) / 28;
+                let kind = match idx {
+                    0 => VfsKind::Folder,
+                    1 => VfsKind::Txt,
+                    2 => VfsKind::Bmp,
+                    3 => VfsKind::Mrt,
+                    4 => VfsKind::Asm,
+                    5 => VfsKind::Cpp,
+                    _ => VfsKind::Cs,
+                };
+                create_new_vfs_item(kind);
+                CTX_OPEN = false;
+                return;
+            }
+        }
+        CTX_OPEN = false;
+        CTX_TARGET_VFS = usize::MAX;
+    }
+
+    if WIN_START_MENU {
+        let sx: isize = 10;
+        let sw: isize = 340;
+        let sh: isize = 522;
+        let sy: isize = bar_y - sh - 8;
+        if mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh {
+            if my >= sy + 76 && my <= sy + 76 + 10 * 38 {
+                let idx = (my - (sy + 76)) / 38;
+                WIN_START_MENU = false;
+                match idx {
+                    0 => { WIN_TERMINAL = true; MIN_TERMINAL = false; FOCUSED_WIN = 1; }
+                    1 => { WIN_PAINT = true; MIN_PAINT = false; FOCUSED_WIN = 5; }
+                    2 => { WIN_EXPLORER = true; MIN_EXPLORER = false; FOCUSED_WIN = 2; }
+                    3 => { WIN_NOTEPAD = true; MIN_NOTEPAD = false; FOCUSED_WIN = 3; }
+                    4 => { WIN_CALC = true; MIN_CALC = false; FOCUSED_WIN = 4; }
+                    5 => { WIN_SETTINGS = true; MIN_SETTINGS = false; FOCUSED_WIN = 6; }
+                    6 => { crate::mines_app::WIN_MINES = true; FOCUSED_WIN = 9; }
+                    7 => { crate::sound::WIN_PLAYER = true; FOCUSED_WIN = 10; }
+                    8 => { crate::snip_app::WIN_SNIP = true; FOCUSED_WIN = 12; }
+                    9 => { crate::weather_app::WIN_WEATHER = true; FOCUSED_WIN = 13; }
+                    _ => {}
+                }
+                return;
+            }
+            let foot_y = sy + sh - 46;
+            if my >= foot_y && my <= foot_y + 32 {
+                WIN_START_MENU = false;
+                if mx >= sx + 14 && mx <= sx + 114 {
+                    crate::power::enter_sleep_mode();
+                } else if mx >= sx + 120 && mx <= sx + 220 {
+                    outb(0x64, 0xFE);
+                } else if mx >= sx + 226 && mx <= sx + 326 {
+                    crate::power::smooth_shutdown();
+                }
+                return;
+            }
+            return;
+        }
+    }
+
+    if my >= bar_y {
+        let tray_x = SCREEN_W - 140;
+        if mx >= tray_x + 34 && mx <= tray_x + 56 {
+            NET_POPUP = !NET_POPUP;
+            return;
+        }
+        if mx >= 10 && mx <= 106 {
+            WIN_START_MENU = !WIN_START_MENU;
+            return;
+        }
+        WIN_START_MENU = false;
+
+        if mx >= 124 && mx <= 160 {
+            if !WIN_EXPLORER {
+                WIN_EXPLORER = true; MIN_EXPLORER = false; FOCUSED_WIN = 2;
+            } else if MIN_EXPLORER {
+                MIN_EXPLORER = false; FOCUSED_WIN = 2;
+            } else if FOCUSED_WIN == 2 {
+                MIN_EXPLORER = true;
+            } else {
+                FOCUSED_WIN = 2;
+            }
+            return;
+        }
+
+        if mx >= 166 && mx <= 202 {
+            if !WIN_TERMINAL {
+                WIN_TERMINAL = true; MIN_TERMINAL = false; FOCUSED_WIN = 1;
+            } else if MIN_TERMINAL {
+                MIN_TERMINAL = false; FOCUSED_WIN = 1;
+            } else if FOCUSED_WIN == 1 {
+                MIN_TERMINAL = true;
+            } else {
+                FOCUSED_WIN = 1;
+            }
+            return;
+        }
+
+        if mx >= 222 {
+            let rel = mx - 222;
+            let target_slot = rel / 114;
+            if rel % 114 <= 108 {
+                let mut slot = 0isize;
+                let dyn_ids: [(u8, bool); 5] = [
+                    (5, WIN_PAINT),
+                    (3, WIN_NOTEPAD),
+                    (4, WIN_CALC),
+                    (6, WIN_SETTINGS),
+                    (7, WIN_TASKMAN),
+                ];
+                for &(id, open) in dyn_ids.iter() {
+                    if !open { continue; }
+                    if slot == target_slot {
+                        match id {
+                            5 => { if MIN_PAINT { MIN_PAINT = false; FOCUSED_WIN = 5; } else if FOCUSED_WIN == 5 { MIN_PAINT = true; } else { FOCUSED_WIN = 5; } }
+                            3 => { if MIN_NOTEPAD { MIN_NOTEPAD = false; FOCUSED_WIN = 3; } else if FOCUSED_WIN == 3 { MIN_NOTEPAD = true; } else { FOCUSED_WIN = 3; } }
+                            4 => { if MIN_CALC { MIN_CALC = false; FOCUSED_WIN = 4; } else if FOCUSED_WIN == 4 { MIN_CALC = true; } else { FOCUSED_WIN = 4; } }
+                            6 => { if MIN_SETTINGS { MIN_SETTINGS = false; FOCUSED_WIN = 6; } else if FOCUSED_WIN == 6 { MIN_SETTINGS = true; } else { FOCUSED_WIN = 6; } }
+                            7 => { if MIN_TASKMAN { MIN_TASKMAN = false; FOCUSED_WIN = 7; } else if FOCUSED_WIN == 7 { MIN_TASKMAN = true; } else { FOCUSED_WIN = 7; } }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        return;
+    }
+
+    WIN_START_MENU = false;
+
+    if WIN_SETTINGS && !MIN_SETTINGS {
+        let (wx, wy, ww, wh) = if MAX_SETTINGS { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (SETTINGS_X, SETTINGS_Y, 510, 340) };
+        if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+            FOCUSED_WIN = 6;
+            if my <= wy + 32 {
+                if mx >= wx + ww - 36 { WIN_SETTINGS = false; MAX_SETTINGS = false; return; }
+                if mx >= wx + ww - 58 { MAX_SETTINGS = !MAX_SETTINGS; return; }
+                if mx >= wx + ww - 80 { MIN_SETTINGS = true; return; }
+                if !MAX_SETTINGS { DRAG_WIN = 6; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+                return;
+            }
+            if mx >= wx + 14 && mx <= wx + 140 && my >= wy + 44 && my <= wy + 44 + 10 * 28 {
+                SETTINGS_TAB = ((my - (wy + 44)) / 28) as usize;
+                return;
+            }
+            if mx >= wx + 156 {
+                match SETTINGS_TAB {
+                    0 => { THEME_ID = (THEME_ID + 1) % 3; }
+                    1 => { SMOOTH_ANIM = !SMOOTH_ANIM; }
+                    2 => { CURSOR_SPEED = if CURSOR_SPEED >= 3 { 1 } else { CURSOR_SPEED + 1 }; }
+                    4 => { SHOW_SHADOWS = !SHOW_SHADOWS; }
+                    5 => { SOUND_ENABLED = !SOUND_ENABLED; }
+                    6 => { NET_ENABLED = !NET_ENABLED; }
+                    7 => { KEYBOARD_RU = !KEYBOARD_RU; }
+                    _ => {}
+                }
+            }
+            return;
+        }
+    }
+
+    if WIN_EXPLORER && !MIN_EXPLORER {
+        let (wx, wy, ww, wh) = if MAX_EXPLORER { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (EXPLORER_X, EXPLORER_Y, 460, 290) };
+        if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+            FOCUSED_WIN = 2;
+            if my <= wy + 32 {
+                if mx >= wx + ww - 36 { WIN_EXPLORER = false; MAX_EXPLORER = false; return; }
+                if mx >= wx + ww - 58 { MAX_EXPLORER = !MAX_EXPLORER; return; }
+                if mx >= wx + ww - 80 { MIN_EXPLORER = true; return; }
+                if !MAX_EXPLORER { DRAG_WIN = 2; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+                return;
+            }
+            if my >= wy + 38 && my <= wy + 62 && mx >= wx + 12 {
+                let b_idx = (mx - (wx + 12)) / 73;
+                match b_idx {
+                    0 => { CUR_DIR = VFS[CUR_DIR].parent; EXPLORER_SEL = usize::MAX; }
+                    1 => { create_new_vfs_item(VfsKind::Folder); }
+                    2 => { create_new_vfs_item(VfsKind::Mrt); }
+                    3 => { create_new_vfs_item(VfsKind::Cpp); }
+                    4 => { if EXPLORER_SEL < MAX_VFS { open_vfs_node(EXPLORER_SEL); } }
+                    5 => { if EXPLORER_SEL < MAX_VFS && EXPLORER_SEL > 0 { VFS[EXPLORER_SEL].kind = VfsKind::Empty; EXPLORER_SEL = usize::MAX; } }
+                    _ => {}
+                }
+                return;
+            }
+if my >= wy + 92 && my <= wy + 92 + 6 * 30 {
+let target_row = (my - (wy + 92)) / 30;
+let mut row = 0isize;
+for i in 1..MAX_VFS {
+if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR {
+if row == target_row {
+if EXPLORER_SEL == i { open_vfs_node(i); } else { EXPLORER_SEL = i; }
+return;
+}
+row += 1;
+}
+}
+}
+return;
+}
+}
+if WIN_NOTEPAD && !MIN_NOTEPAD {
+let (wx, wy, ww, wh) = if MAX_NOTEPAD { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (NOTEPAD_X, NOTEPAD_Y, 460, 320) };
+if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+FOCUSED_WIN = 3;
+if my <= wy + 32 {
+if mx >= wx + ww - 36 { WIN_NOTEPAD = false; MAX_NOTEPAD = false; return; }
+if mx >= wx + ww - 58 { MAX_NOTEPAD = !MAX_NOTEPAD; return; }
+if mx >= wx + ww - 80 { MIN_NOTEPAD = true; return; }
+if !MAX_NOTEPAD { DRAG_WIN = 3; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+return;
+}
+if mx >= wx + 350 && mx <= wx + 446 && my >= wy + 36 && my <= wy + 58 {
+if OPEN_FILE_IDX < MAX_VFS {
+let len = NOTEPAD_TEXT_LEN.min(255);
+VFS[OPEN_FILE_IDX].content[..len].copy_from_slice(&NOTEPAD_TEXT[..len]);
+VFS[OPEN_FILE_IDX].content_len = len;
+}
+}
+return;
+}
+}
+if WIN_PAINT && !MIN_PAINT {
+let (wx, wy, ww, wh) = if MAX_PAINT { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (PAINT_X, PAINT_Y, crate::paint_app::PAINT_W, crate::paint_app::PAINT_H) };
+if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+FOCUSED_WIN = 5;
+if my <= wy + 32 {
+if mx >= wx + ww - 36 { WIN_PAINT = false; MAX_PAINT = false; return; }
+if mx >= wx + ww - 58 { MAX_PAINT = !MAX_PAINT; return; }
+if mx >= wx + ww - 80 { MIN_PAINT = true; return; }
+if !MAX_PAINT { DRAG_WIN = 5; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+}
+return;
+}
+}
+if WIN_TERMINAL && !MIN_TERMINAL {
+let (wx, wy, ww, wh) = if MAX_TERMINAL { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (TERMINAL_X, TERMINAL_Y, 540, 310) };
+if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+FOCUSED_WIN = 1;
+if my <= wy + 32 {
+if mx >= wx + ww - 36 { WIN_TERMINAL = false; MAX_TERMINAL = false; return; }
+if mx >= wx + ww - 58 { MAX_TERMINAL = !MAX_TERMINAL; return; }
+if mx >= wx + ww - 80 { MIN_TERMINAL = true; return; }
+if !MAX_TERMINAL { DRAG_WIN = 1; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+}
+return;
+}
+}
+if WIN_CALC && !MIN_CALC {
+let (wx, wy, ww, wh) = if MAX_CALC { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (CALC_X, CALC_Y, 260, 276) };
+if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+FOCUSED_WIN = 4;
+if my <= wy + 32 {
+if mx >= wx + ww - 36 { WIN_CALC = false; MAX_CALC = false; return; }
+if mx >= wx + ww - 58 { MAX_CALC = !MAX_CALC; return; }
+if mx >= wx + ww - 80 { MIN_CALC = true; return; }
+if !MAX_CALC { DRAG_WIN = 4; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+}
+return;
+}
+}
+if WIN_TASKMAN && !MIN_TASKMAN {
+let (wx, wy, ww, wh) = if MAX_TASKMAN { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (TASKMAN_X, TASKMAN_Y, 360, 210) };
+if mx >= wx && mx <= wx + ww && my >= wy && my <= wy + wh {
+FOCUSED_WIN = 7;
+if my <= wy + 32 {
+if mx >= wx + ww - 36 { WIN_TASKMAN = false; MAX_TASKMAN = false; return; }
+if mx >= wx + ww - 58 { MAX_TASKMAN = !MAX_TASKMAN; return; }
+if mx >= wx + ww - 80 { MIN_TASKMAN = true; return; }
+    }
+    if mx >= wx + 236 && mx <= wx + 356 && my >= wy + 258 && my <= wy + 282 { let _ = crate::sysmon::run_cpu_benchmark(); return; }
+    if false {
+if !MAX_TASKMAN { DRAG_WIN = 7; DRAG_OFF_X = mx - wx; DRAG_OFF_Y = my - wy; }
+}
+return;
+}
+}
+if mx >= 18 && mx <= 94 && my >= 18 && my <= 18 + 6 * 94 {
+let idx = (my - 18) / 94;
+if DESKTOP_SEL == idx && DESKTOP_CLICK_TIMER < 400 {
+match idx {
+0 => { WIN_TERMINAL = true; MIN_TERMINAL = false; FOCUSED_WIN = 1; }
+1 => { WIN_PAINT = true; MIN_PAINT = false; FOCUSED_WIN = 5; }
+2 => { WIN_EXPLORER = true; MIN_EXPLORER = false; FOCUSED_WIN = 2; }
+3 => { WIN_NOTEPAD = true; MIN_NOTEPAD = false; FOCUSED_WIN = 3; }
+4 => { WIN_CALC = true; MIN_CALC = false; FOCUSED_WIN = 4; }
+5 => { WIN_SETTINGS = true; MIN_SETTINGS = false; FOCUSED_WIN = 6; }
+                    6 => { crate::mines_app::WIN_MINES = true; FOCUSED_WIN = 9; }
+_ => {}
+}
+DESKTOP_SEL = -1;
+} else {
+DESKTOP_SEL = idx;
+DESKTOP_CLICK_TIMER = 0;
+}
+return;
+}
+if mx >= 112 && mx <= 184 && my >= 18 {
+let target_col = (my - 18) / 94;
+let mut col_idx = 0isize;
+for idx in 1..MAX_VFS {
+if VFS[idx].kind != VfsKind::Empty && VFS[idx].parent == 0 && col_idx < 6 {
+if col_idx == target_col {
+let sel_id = 100 + idx as isize;
+if DESKTOP_SEL == sel_id && DESKTOP_CLICK_TIMER < 400 {
+if VFS[idx].kind == VfsKind::Folder {
+CUR_DIR = idx;
+EXPLORER_SEL = usize::MAX;
+WIN_EXPLORER = true;
+MIN_EXPLORER = false;
+FOCUSED_WIN = 2;
+} else {
+open_vfs_node(idx);
+}
+DESKTOP_SEL = -1;
+} else {
+DESKTOP_SEL = sel_id;
+DESKTOP_CLICK_TIMER = 0;
+}
+return;
+}
+col_idx += 1;
+}
+}
+}
+DESKTOP_SEL = -1;
+}
+unsafe fn step_anim(cur: &mut isize, target: bool) {
+    if !SMOOTH_ANIM {
+        *cur = if target { 100 } else { 0 };
+        return;
+    }
+    if target {
+        if *cur < 100 {
+            *cur = (*cur + 16).min(100);
+        }
+    } else if *cur > 0 {
+        *cur = (*cur - 20).max(0);
+    }
+}
+
+unsafe fn check_kernel_net() -> bool { if true { return NET_ENABLED && NET_ENABLED; }
+    if !NET_ENABLED {
+        return false;
+    }
+    for bus in 0..=255u8 {
+        for dev in 0..32u8 {
+            let addr: u32 = 0x8000_0000 | ((bus as u32) << 16) | ((dev as u32) << 11);
+            asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nomem, nostack));
+            let id: u32;
+            asm!("in eax, dx", out("eax") id, in("dx") 0xCFCu16, options(nomem, nostack));
+            if id == 0xFFFF_FFFF || id == 0 {
+                continue;
+            }
+            let class_addr = addr | 0x08;
+            asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") class_addr, options(nomem, nostack));
+            let class_rev: u32;
+            asm!("in eax, dx", out("eax") class_rev, in("dx") 0xCFCu16, options(nomem, nostack));
+            if ((class_rev >> 24) as u8) == 0x02 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+
+
+
+static mut RAM_BACKBUFFER: [u32; 1920 * 1080] = [0; 1920 * 1080];
+
+#[inline(always)]
+unsafe fn flush_backbuffer_to_vram(vram: FbPtr, total_pixels: usize) {
+    let src = RAM_BACKBUFFER.as_ptr();
+    let dst = vram;
+    let qwords = total_pixels / 2;
+    let src64 = src as *const u64;
+    let dst64 = dst as *mut u64;
+    let mut i = 0usize;
+    while i < qwords {
+        core::ptr::write_volatile(dst64.add(i), *src64.add(i));
+        i += 1;
+    }
+    if (total_pixels & 1) != 0 {
+        core::ptr::write_volatile(dst.add(total_pixels - 1), *src.add(total_pixels - 1));
+    }
+}
+
+pub unsafe fn run_graphics(_mb_magic: u32, mb_info: u32) -> ! {
+    if mb_info != 0 {
+        parse_multiboot2(mb_info as usize);
+    }
+    init_vfs();
+    init_wallpaper_embedded();
+    if !try_draw_wallpaper_bmp(BG_BUFFER.as_mut_ptr()) {
+        for y in 0..SCREEN_H {
+            let c = 0x000F172A + (((y * 25 / SCREEN_H) as u32) << 8) + ((y * 55 / SCREEN_H) as u32);
+            let row = BG_BUFFER.as_mut_ptr().offset(y * SCREEN_W);
+            for x in 0..SCREEN_W {
+                *row.offset(x) = c;
+            }
+        }
+    }
+    init_ps2_mouse();
+    let _ = crate::disk::init_disk_driver();
+    crate::mines_app::reset_mines(12345);
+    crate::sound::start_track(0, SOUND_ENABLED);
+    
+    WIN_TERMINAL = true;
+    FOCUSED_WIN = 1;
+    let mut shift = false;
+    let mut ctrl_held = false;
+    let mut alt_held = false;
+
+    crate::rdm::register_rdm_fb(REAL_FB, SCREEN_W, SCREEN_H);
+    crate::power::register_power_fb(REAL_FB, SCREEN_W, SCREEN_H);
+    crate::video_driver::init();
+    crate::kernels::login_screen::run_login_gate(REAL_FB, BG_BUFFER.as_ptr());
+    loop {
+        for _ in 0..64 {
+            let st = inb(0x64);
+            if (st & 0x01) == 0 {
+                break;
+            }
+            let data = inb(0x60);
+            if (st & 0x20) != 0 {
+                if MOUSE_CYCLE == 0 && (data & 0x08) == 0 {
+                    continue;
+                }
+                match MOUSE_CYCLE {
+                    0 => { MOUSE_BYTE0 = data; MOUSE_CYCLE = 1; }
+                    1 => { MOUSE_BYTE1 = data; MOUSE_CYCLE = 2; }
+                    _ => {
+                        MOUSE_CYCLE = 0;
+                        let dx = (MOUSE_BYTE1 as i8 as isize) * CURSOR_SPEED;
+                        let dy = (data as i8 as isize) * CURSOR_SPEED;
+                        MOUSE_X = (MOUSE_X + dx).clamp(0, SCREEN_W - 4);
+                        MOUSE_Y = (MOUSE_Y - dy).clamp(0, SCREEN_H - 4);
+                        let prev_left = MOUSE_LEFT;
+                        let prev_right = MOUSE_RIGHT;
+                        MOUSE_LEFT = (MOUSE_BYTE0 & 0x01) != 0;
+                        MOUSE_RIGHT = (MOUSE_BYTE0 & 0x02) != 0;
+                        WM.mouse_x = MOUSE_X;
+                        if crate::snip_app::handle_snip_overlay_mouse(MOUSE_X, MOUSE_Y, MOUSE_LEFT, SCREEN_W, SCREEN_H) { continue; }
+                        WM.mouse_y = MOUSE_Y;
+                        WM.mouse_pressed = MOUSE_LEFT;
+
+                        if MOUSE_RIGHT && !prev_right {
+                            RENAME_OPEN = false;
+                            CTX_TARGET_VFS = usize::MAX;
+                            let on_taskbar = MOUSE_Y >= SCREEN_H - 46;
+
+                            if WIN_EXPLORER && MOUSE_X >= EXPLORER_X + 12 && MOUSE_X <= EXPLORER_X + 448 && MOUSE_Y >= EXPLORER_Y + 92 && MOUSE_Y <= EXPLORER_Y + 92 + 6 * 30 {
+                                let target_row = (MOUSE_Y - (EXPLORER_Y + 92)) / 30;
+                                let mut row = 0isize;
+                                for i in 1..MAX_VFS {
+                                    if VFS[i].kind != VfsKind::Empty && VFS[i].parent == CUR_DIR {
+                                        if row == target_row {
+                                            EXPLORER_SEL = i;
+                                            CTX_TARGET_VFS = i;
+                                            CTX_OPEN = true;
+                                            CTX_X = MOUSE_X;
+                                            CTX_Y = MOUSE_Y;
+                                            break;
+                                        }
+                                        row += 1;
+                                    }
+                                }
+                            } else {
+                                let on_win =
+                                    (WIN_TERMINAL && MOUSE_X >= TERMINAL_X && MOUSE_X <= TERMINAL_X + 540 && MOUSE_Y >= TERMINAL_Y && MOUSE_Y <= TERMINAL_Y + 310) ||
+                                    (WIN_EXPLORER && MOUSE_X >= EXPLORER_X && MOUSE_X <= EXPLORER_X + 460 && MOUSE_Y >= EXPLORER_Y && MOUSE_Y <= EXPLORER_Y + 290) ||
+                                    (WIN_NOTEPAD && MOUSE_X >= NOTEPAD_X && MOUSE_X <= NOTEPAD_X + 460 && MOUSE_Y >= NOTEPAD_Y && MOUSE_Y <= NOTEPAD_Y + 320) ||
+                                    (WIN_CALC && MOUSE_X >= CALC_X && MOUSE_X <= CALC_X + 260 && MOUSE_Y >= CALC_Y && MOUSE_Y <= CALC_Y + 276) ||
+(WIN_SETTINGS && MOUSE_X >= SETTINGS_X && MOUSE_X <= SETTINGS_X + 510 && MOUSE_Y >= SETTINGS_Y && MOUSE_Y <= SETTINGS_Y + 340) ||
+(WIN_TASKMAN && MOUSE_X >= TASKMAN_X && MOUSE_X <= TASKMAN_X + 360 && MOUSE_Y >= TASKMAN_Y && MOUSE_Y <= TASKMAN_Y + 210) ||
+(WIN_PAINT && MOUSE_X >= PAINT_X && MOUSE_X <= PAINT_X + crate::paint_app::PAINT_W && MOUSE_Y >= PAINT_Y && MOUSE_Y <= PAINT_Y + crate::paint_app::PAINT_H);
+if !on_taskbar && !on_win {
+if MOUSE_X >= 112 && MOUSE_X <= 184 && MOUSE_Y >= 18 {
+let target_col = (MOUSE_Y - 18) / 94;
+let mut col_idx = 0isize;
+for idx in 1..MAX_VFS {
+if VFS[idx].kind != VfsKind::Empty && VFS[idx].parent == 0 && col_idx < 6 {
+if col_idx == target_col {
+DESKTOP_SEL = 100 + idx as isize;
+CTX_TARGET_VFS = idx;
+break;
+}
+col_idx += 1;
+}
+}
+}
+CTX_OPEN = true;
+CTX_X = MOUSE_X;
+CTX_Y = MOUSE_Y;
+} else {
+CTX_OPEN = false;
+}
+}
+}
+if !MOUSE_LEFT {
+                            DRAG_WIN = 0;
+                        } else if DRAG_WIN != 0 {
+                            match DRAG_WIN {
+                                1 => { TERMINAL_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); TERMINAL_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                2 => { EXPLORER_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); EXPLORER_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                3 => { NOTEPAD_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); NOTEPAD_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                4 => { CALC_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); CALC_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                5 => { PAINT_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); PAINT_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                6 => { SETTINGS_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); SETTINGS_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                7 => { TASKMAN_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); TASKMAN_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+            9 => { crate::mines_app::MINES_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); crate::mines_app::MINES_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+            10 => { crate::sound::PLAYER_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); crate::sound::PLAYER_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+            12 => { crate::snip_app::SNIP_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); crate::snip_app::SNIP_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+            13 => { crate::weather_app::WEATHER_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); crate::weather_app::WEATHER_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+            8 => { BROWSER_X = (MOUSE_X - DRAG_OFF_X).clamp(0, SCREEN_W - 100); BROWSER_Y = (MOUSE_Y - DRAG_OFF_Y).clamp(0, SCREEN_H - 80); }
+                                _ => {}
+                            }
+                        } else if !prev_left {
+                            handle_mouse_click(MOUSE_X, MOUSE_Y);
+                        }
+
+                        if WIN_PAINT && DRAG_WIN == 0 {
+                            crate::paint_app::handle_paint_mouse(PAINT_X, PAINT_Y, MOUSE_X, MOUSE_Y, MOUSE_LEFT);
+                        }
+                    }
+                }
+            } else {
+                // Отслеживание модификаторов Ctrl (0x1D) и Alt (0x38)
+                if data == 0x1D { ctrl_held = true; continue; }
+                if data == 0x9D { ctrl_held = false; continue; }
+                if data == 0x38 { alt_held = true; continue; }
+                if data == 0xB8 { alt_held = false; continue; }
+
+                // Обработка нажатий горячих клавиш (только make-коды без бита 0x80)
+                if (data & 0x80) == 0 && data != 0xE0 {
+                    // Клавиша Win (0x5B) или Ctrl + Esc (0x01) -> Меню Пуск
+                    if data == 0x5B || (ctrl_held && data == 0x01) {
+                        WIN_START_MENU = !WIN_START_MENU;
+                        if WIN_START_MENU && ANIM_START == 0 { ANIM_START = 80; }
+                        continue;
+                    }
+                    // F11 (0x57) -> Свернуть все окна (показать рабочий стол)
+                    if data == 0x57 {
+                        WIN_TERMINAL = false;
+                        WIN_EXPLORER = false;
+                        WIN_NOTEPAD = false;
+                        WIN_CALC = false;
+                        WIN_PAINT = false;
+                        WIN_SETTINGS = false;
+                        WIN_TASKMAN = false;
+                        crate::mines_app::WIN_MINES = false;
+                        crate::sound::WIN_PLAYER = false;
+                        WIN_START_MENU = false;
+                        continue;
+                    }
+                    // Alt + F4 (0x3E) или Ctrl + W (0x11) -> Закрыть активное окно
+                    if (alt_held && data == 0x3E) || (ctrl_held && data == 0x11) {
+                        match FOCUSED_WIN {
+                            1 => WIN_TERMINAL = false,
+                            2 => WIN_EXPLORER = false,
+                            3 => WIN_NOTEPAD = false,
+                            4 => WIN_CALC = false,
+                            5 => WIN_PAINT = false,
+                            6 => WIN_SETTINGS = false,
+                            7 => WIN_TASKMAN = false,
+                            9 => crate::mines_app::WIN_MINES = false,
+                            10 => {
+                                crate::sound::WIN_PLAYER = false;
+                                crate::sound::IS_PLAYING = false;
+                                crate::sound::stop_sound();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // Комбинации с зажатым Ctrl
+                    if ctrl_held {
+                        match data {
+                            0x14 => { WIN_TERMINAL = true; MIN_TERMINAL = false; FOCUSED_WIN = 1; continue; } // Ctrl+T
+                            0x12 => { WIN_EXPLORER = true; MIN_EXPLORER = false; FOCUSED_WIN = 2; continue; } // Ctrl+E
+                            0x31 => { WIN_NOTEPAD = true; MIN_NOTEPAD = false; FOCUSED_WIN = 3; continue; }   // Ctrl+N
+                            0x25 => { WIN_CALC = true; MIN_CALC = false; FOCUSED_WIN = 4; continue; }         // Ctrl+K
+                            0x19 => { WIN_PAINT = true; MIN_PAINT = false; FOCUSED_WIN = 5; continue; }       // Ctrl+P
+                            0x1F => { WIN_SETTINGS = true; MIN_SETTINGS = false; FOCUSED_WIN = 6; continue; } // Ctrl+S
+                            0x20 => { WIN_TASKMAN = true; MIN_TASKMAN = false; FOCUSED_WIN = 7; continue; }   // Ctrl+D
+                            0x32 => { crate::mines_app::WIN_MINES = true; FOCUSED_WIN = 9; continue; }        // Ctrl+M
+                            0x30 => { crate::sound::WIN_PLAYER = true; FOCUSED_WIN = 10; continue; }          // Ctrl+B
+                            0x0F => {                                                                         // Ctrl+Tab
+                                let order: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+                                let mut cur_idx = 0usize;
+                                for (idx, &w) in order.iter().enumerate() {
+                                    if w == FOCUSED_WIN { cur_idx = idx; break; }
+                                }
+                                for step in 1..=9 {
+                                    let cand = order[(cur_idx + step) % 9];
+                                    let open = match cand {
+                                        1 => WIN_TERMINAL && !MIN_TERMINAL,
+                                        2 => WIN_EXPLORER && !MIN_EXPLORER,
+                                        3 => WIN_NOTEPAD && !MIN_NOTEPAD,
+                                        4 => WIN_CALC && !MIN_CALC,
+                                        5 => WIN_PAINT && !MIN_PAINT,
+                                        6 => WIN_SETTINGS && !MIN_SETTINGS,
+                                        7 => WIN_TASKMAN && !MIN_TASKMAN,
+                                        9 => crate::mines_app::WIN_MINES,
+                                        10 => crate::sound::WIN_PLAYER,
+                                        _ => false,
+                                    };
+                                    if open {
+                                        FOCUSED_WIN = cand;
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                WM.last_scancode = data;
+                if data == 0x2A || data == 0x36 { shift = true; continue; }
+                if data == 0xAA || data == 0xB6 { shift = false; continue; }
+                if (data & 0x80) != 0 { continue; }
+
+                if RENAME_OPEN {
+if data == 0x0E && RENAME_LEN > 0 {
+RENAME_LEN -= 1;
+} else if data == 0x1C {
+apply_rename();
+} else if data == 0x01 && crate::snip_app::SNIP_SELECTING { crate::snip_app::SNIP_SELECTING = false; crate::snip_app::WIN_SNIP = true; continue; }
+                    if data == 0x01 {
+RENAME_OPEN = false;
+} else {
+let ch = scancode_to_ascii(data, shift);
+if ch != 0 && ch != 47 && RENAME_LEN < 28 {
+RENAME_BUF[RENAME_LEN] = ch;
+RENAME_LEN += 1;
+}
+}
+} else if FOCUSED_WIN == 1 && WIN_TERMINAL {
+                    if data == 0x0E && CONSOLE_TEXT_LEN > 0 {
+                        CONSOLE_TEXT_LEN -= 1;
+                    } else if data == 0x1C {
+                        if let Ok(cmd) = core::str::from_utf8(&CONSOLE_TEXT[..CONSOLE_TEXT_LEN]) {
+                            execute_terminal_command(cmd);
+                        }
+                        CONSOLE_TEXT_LEN = 0;
+                    } else {
+                        let ch = scancode_to_ascii(data, shift);
+                        if ch != 0 && CONSOLE_TEXT_LEN < 56 {
+                            CONSOLE_TEXT[CONSOLE_TEXT_LEN] = ch;
+                            CONSOLE_TEXT_LEN += 1;
+                        }
+                    }
+                } else if FOCUSED_WIN == 3 && WIN_NOTEPAD {
+                    if data == 0x0E && NOTEPAD_TEXT_LEN > 0 {
+                        NOTEPAD_TEXT_LEN -= 1;
+                    } else if data == 0x1C && NOTEPAD_TEXT_LEN < 2000 {
+                        NOTEPAD_TEXT[NOTEPAD_TEXT_LEN] = b'\n';
+                        NOTEPAD_TEXT_LEN += 1;
+                    } else {
+                        let ch = scancode_to_ascii(data, shift);
+                        if ch != 0 && NOTEPAD_TEXT_LEN < 2000 {
+                            NOTEPAD_TEXT[NOTEPAD_TEXT_LEN] = ch;
+                            NOTEPAD_TEXT_LEN += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        step_anim(&mut ANIM_TERMINAL, WIN_TERMINAL && !MIN_TERMINAL);
+step_anim(&mut ANIM_EXPLORER, WIN_EXPLORER && !MIN_EXPLORER);
+step_anim(&mut ANIM_NOTEPAD, WIN_NOTEPAD && !MIN_NOTEPAD);
+step_anim(&mut ANIM_CALC, WIN_CALC && !MIN_CALC);
+step_anim(&mut ANIM_PAINT, WIN_PAINT && !MIN_PAINT);
+step_anim(&mut ANIM_SETTINGS, WIN_SETTINGS && !MIN_SETTINGS);
+step_anim(&mut ANIM_TASKMAN, WIN_TASKMAN && !MIN_TASKMAN);
+step_anim(&mut ANIM_START, WIN_START_MENU);
+let fb = BACK_BUFFER.as_mut_ptr();
+// --- Иконка и окно midenBrowser ---
+let bx: isize = 200;
+let by: isize = 24;
+draw_glass_rect(fb, bx, by, 72, 76, 0x001E293B, 180);
+draw_solid_rect(fb, bx + 16, by + 8, 40, 40, 0x000284C7);
+draw_txt(fb, bx + 24, by + 23, "WWW", 0x00FFFFFF);
+draw_txt(fb, bx + 12, by + 56, "Браузер", 0x00F8FAFC);
+
+ptr::copy_nonoverlapping(BG_BUFFER.as_ptr(), fb, (SCREEN_W * SCREEN_H) as usize);
+draw_desktop_icons(fb);
+if ANIM_EXPLORER > 0 {
+let (wx, wy, ww, wh) = if MAX_EXPLORER { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (EXPLORER_X, EXPLORER_Y, 460, 290) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Проводник (midenVFS)", FOCUSED_WIN == 2, ANIM_EXPLORER);
+if ready { draw_explorer_contents(fb, ax, ay); }
+}
+if ANIM_NOTEPAD > 0 {
+let (wx, wy, ww, wh) = if MAX_NOTEPAD { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (NOTEPAD_X, NOTEPAD_Y, 460, 320) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Блокнот (Notepad)", FOCUSED_WIN == 3, ANIM_NOTEPAD);
+if ready { draw_notepad_contents(fb, ax, ay); }
+}
+if ANIM_CALC > 0 {
+let (wx, wy, ww, wh) = if MAX_CALC { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (CALC_X, CALC_Y, 260, 276) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Калькулятор", FOCUSED_WIN == 4, ANIM_CALC);
+if ready { draw_calc_contents(fb, ax, ay); }
+}
+if ANIM_SETTINGS > 0 {
+let (wx, wy, ww, wh) = if MAX_SETTINGS { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (SETTINGS_X, SETTINGS_Y, 510, 340) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Настройки системы (10 вкладок)", FOCUSED_WIN == 6, ANIM_SETTINGS);
+if ready { draw_settings_contents(fb, ax, ay); }
+}
+if ANIM_TASKMAN > 0 {
+let (wx, wy, ww, wh) = if MAX_TASKMAN { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (TASKMAN_X, TASKMAN_Y, 360, 210) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Диспетчер задач", FOCUSED_WIN == 7, ANIM_TASKMAN);
+if ready { draw_taskman_contents(fb, ax, ay); }
+}
+if ANIM_TERMINAL > 0 {
+let (wx, wy, ww, wh) = if MAX_TERMINAL { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (TERMINAL_X, TERMINAL_Y, 540, 310) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Терминал midenOS", FOCUSED_WIN == 1, ANIM_TERMINAL);
+if ready { draw_terminal_contents(fb, ax, ay); }
+}
+if ANIM_PAINT > 0 {
+let (wx, wy, ww, wh) = if MAX_PAINT { (0, 0, SCREEN_W, SCREEN_H - 46) } else { (PAINT_X, PAINT_Y, crate::paint_app::PAINT_W, crate::paint_app::PAINT_H) };
+let (ax, ay, _, _, ready) = draw_animated_window(fb, wx, wy, ww, wh, "Paint Studio", FOCUSED_WIN == 5, ANIM_PAINT);
+if ready { crate::paint_app::draw_paint_window(fb, ax, ay); }
+}
+
+    crate::mines_app::draw_mines(fb, SCREEN_W, MOUSE_X, MOUSE_Y, FOCUSED_WIN == 9);
+    crate::sound::draw_player(fb, SCREEN_W, MOUSE_X, MOUSE_Y, FOCUSED_WIN == 10);
+    crate::cd_popup::draw_cd_popup(fb, SCREEN_W, MOUSE_X, MOUSE_Y);
+    crate::snip_app::draw_snip_window(fb, SCREEN_W, MOUSE_X, MOUSE_Y, FOCUSED_WIN == 12);
+    crate::weather_app::draw_weather_window(fb, SCREEN_W, MOUSE_X, MOUSE_Y, FOCUSED_WIN == 13);
+    draw_taskbar_and_start(fb);
+    crate::snip_app::draw_snip_overlay(fb, SCREEN_W, SCREEN_H, MOUSE_X, MOUSE_Y);
+        draw_context_menu(fb);
+        draw_cursor(fb, MOUSE_X, MOUSE_Y);
+
+        let pitch_u32 = if FB_PITCH > 0 { (FB_PITCH / 4) as usize } else { SCREEN_W as usize };
+        if pitch_u32 == SCREEN_W as usize {
+            ptr::copy_nonoverlapping(fb, REAL_FB, (SCREEN_W * SCREEN_H) as usize);
+        } else {
+            for y in 0..(SCREEN_H as usize) {
+                ptr::copy_nonoverlapping(fb.add(y * (SCREEN_W as usize)), REAL_FB.add(y * pitch_u32), SCREEN_W as usize);
+            }
+        }
+        
+        crate::sound::tick_sound(SOUND_ENABLED);
+        crate::sysmon::sample_cpu_activity();
+        static mut CD_POLL_TICK: u32 = 0;
+        CD_POLL_TICK = CD_POLL_TICK.wrapping_add(1);
+        crate::cd_popup::tick_cd_monitor(CD_POLL_TICK);
+        if (CD_POLL_TICK & 0x3FF) == 0 {
+            crate::video_driver::init();
+        }
+        core::arch::asm!("pause", options(nomem, nostack));
+        
+    }
+}
+
+pub fn write_vfs_file(_name: &str, _data: &[u8]) {}
+pub fn pack_vfs_to_tar() {}
+pub fn unpack_tar_from_vfs() -> bool { false }
