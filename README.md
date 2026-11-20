@@ -1,4 +1,5 @@
 MidenOS is an operating system with a fully open-source codebase. You can create your own distributions of this OS by downloading the kernel file.
+
 🧨HOW TO INSTALL🧨
 
 1) Write the image to a flash drive (or another storage device).
@@ -9,7 +10,11 @@ MidenOS is an operating system with a fully open-source codebase. You can create
 ATTENTION! At this stage, it is not recommended to install Miden on your primary PC, as it is still a work in progress.
 
 ---------
-MidenOS - Ос у которой полностью открытый код. Вы можете делать дистрибутивы данной ос качая файл ядра. 
+MidenOS - Ос у которой полностью открытый код. Вы можете делать дистрибутивы данной ос качая файл ядра.
+
+
+
+
 🧨КАК УСТАНОВИТЬ🧨
 
 1) Запишите образ на флешку(или другой накопитель)
